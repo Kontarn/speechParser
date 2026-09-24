@@ -1,0 +1,14 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+logs/
+tmp/
+*.mp4
+*.mp3
+*.wav
+*.txt
+*.srt
+!README.md
+!requirements.txt

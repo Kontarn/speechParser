@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      # Кэш моделей Whisper — чтобы не скачивать каждый раз при пересборке
+      - whisper_cache:/root/.cache/huggingface
+      # Логи
+      - ./logs:/app/logs
+
+volumes:
+  whisper_cache:
