@@ -61,7 +61,9 @@ nano .env
 | `BOT_TOKEN`     | Токен бота от [@BotFather](https://t.me/BotFather)        |
 | `ALLOWED_USER_ID` | Твой Telegram user_id (узнать у [@userinfobot](https://t.me/userinfobot)) |
 | `WHISPER_MODEL` | Модель Whisper (по умолчанию `large-v3`)                  |
+| `WHISPER_WORKERS` | Число параллельных чанков (по умолчанию `1`; `2` требует больше RAM) |
 | `MTS_SESSION_ID`| Cookie `access` с my.mts-link.ru (только для приватных записей) |
+| `TRANSCRIPTION_TIMEOUT_SECONDS` | Максимальное время обработки (по умолчанию 10800 секунд / 3 часа) |
 
 ## Запуск (без Docker)
 
@@ -86,6 +88,8 @@ python bot.py
 2. Отправь боту ссылку: `https://my.mts-link.ru/...`
 3. Бот пришлёт статусные сообщения в процессе работы
 4. Когда готово — пришлёт `.txt` файл с таймстампами
+
+Чтобы остановить текущую расшифровку, отправь команду `/stop`. Бот остановит обработку и пришлёт уже готовую часть текста.
 
 ## Модели Whisper и скорость на CPU
 
