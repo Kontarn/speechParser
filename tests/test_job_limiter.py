@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 
 import bot
 import pipeline
@@ -52,6 +53,27 @@ class JobLimiterTests(unittest.TestCase):
         pipeline.clear_model()
         self.assertIsNone(pipeline._model)
         self.assertIsNone(pipeline._model_name)
+
+    def test_single_model_worker_uses_all_cpu_threads(self):
+        whisper_model = Mock(return_value=object())
+        fake_module = Mock(WhisperModel=whisper_model)
+        pipeline.clear_model()
+
+        with (
+            patch.dict("sys.modules", {"faster_whisper": fake_module}),
+            patch.object(pipeline, "_get_cpu_count", return_value=8),
+            patch.object(pipeline, "get_worker_count", return_value=8),
+        ):
+            pipeline.get_model("medium", workers=1)
+
+        whisper_model.assert_called_once_with(
+            "medium",
+            device="cpu",
+            compute_type="int8",
+            num_workers=1,
+            cpu_threads=8,
+        )
+        pipeline.clear_model()
 
     def test_build_chunk_ranges(self):
         ranges = pipeline.build_chunk_ranges(3700, chunk_seconds=600)

@@ -175,10 +175,10 @@ def build_chunk_ranges(duration: float, chunk_seconds: int = 600) -> list[tuple[
     return ranges
 
 
-def get_model(model_name: str):
+def get_model(model_name: str, workers: Optional[int] = None):
     global _model, _model_name, _model_workers
     effective_model = get_effective_model_name(model_name)
-    workers = get_worker_count(effective_model)
+    workers = get_worker_count(effective_model) if workers is None else max(1, workers)
     cpu_count = _get_cpu_count()
     cpu_threads = max(1, cpu_count // workers)
     if _model is None or _model_name != effective_model or _model_workers != workers:
@@ -295,11 +295,12 @@ def _transcribe_one_file(
     chunk_offset: float = 0.0,
     chunk_number: int = 0,
     chunk_total: int = 1,
+    model_workers: Optional[int] = None,
 ) -> None:
     """Транскрибирует один файл и дописывает результат в output_path."""
     import time
 
-    model = get_model(model_name)
+    model = get_model(model_name, workers=model_workers)
     log.info(f"Начинаю транскрибацию: {input_path}")
 
     segments, info = model.transcribe(
@@ -378,8 +379,8 @@ def transcribe_file(
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write("")
 
-            get_model(model_name)
-            workers = _model_workers
+            workers = min(get_worker_count(model_name), len(ranges))
+            get_model(model_name, workers=workers)
             if workers == 1:
                 for i, (start, end) in enumerate(ranges, start=1):
                     if update_status:
@@ -392,6 +393,7 @@ def transcribe_file(
                         chunk_offset=start,
                         chunk_number=i,
                         chunk_total=len(ranges),
+                        model_workers=workers,
                     )
                     clear_model()
             else:
@@ -407,6 +409,7 @@ def transcribe_file(
                             chunk_offset=start,
                             chunk_number=i,
                             chunk_total=len(ranges),
+                            model_workers=workers,
                         )
                         for i, (start, end) in enumerate(ranges, start=1)
                     ]
@@ -425,7 +428,7 @@ def transcribe_file(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     try:
-        model = get_model(model_name)
+        model = get_model(model_name, workers=1)
         log.info(f"Начинаю транскрибацию: {input_path}")
 
         segments, info = model.transcribe(
