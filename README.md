@@ -61,7 +61,7 @@ nano .env
 | `BOT_TOKEN`     | Токен бота от [@BotFather](https://t.me/BotFather)        |
 | `ALLOWED_USER_ID` | Твой Telegram user_id (узнать у [@userinfobot](https://t.me/userinfobot)) |
 | `WHISPER_MODEL` | Модель Whisper (по умолчанию `large-v3`)                  |
-| `WHISPER_WORKERS` | Число параллельных чанков (по умолчанию `1`; `2` требует больше RAM) |
+| `WHISPER_WORKERS` | Число параллельных обработчиков (`auto` рассчитывает по CPU и доступной RAM; можно задать верхний предел числом) |
 | `MTS_SESSION_ID`| Cookie `access` с my.mts-link.ru (только для приватных записей) |
 | `TRANSCRIPTION_TIMEOUT_SECONDS` | Максимальное время обработки (по умолчанию 10800 секунд / 3 часа) |
 

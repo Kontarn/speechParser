@@ -35,6 +35,15 @@ MTS_URL_PATTERN = re.compile(
 _model = None
 _model_name: Optional[str] = None
 _model_workers = 1
+_GIB = 1024 ** 3
+_WORKER_MEMORY_GIB = {
+    "tiny": 0.6,
+    "base": 0.9,
+    "small": 1.5,
+    "medium": 2.5,
+    "large": 4.0,
+    "turbo": 3.0,
+}
 
 
 def get_effective_model_name(model_name: Optional[str]) -> str:
@@ -42,6 +51,106 @@ def get_effective_model_name(model_name: Optional[str]) -> str:
     if model_name and model_name.strip():
         return model_name.strip()
     return "medium"
+
+
+def _get_cpu_count() -> int:
+    cpu_count = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            cpu_count = min(cpu_count, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+
+    for quota_path, period_path in (
+        ("/sys/fs/cgroup/cpu.max", None),
+        ("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+    ):
+        try:
+            if period_path is None:
+                quota, period = Path(quota_path).read_text().split()
+                if quota == "max":
+                    continue
+            else:
+                quota = Path(quota_path).read_text().strip()
+                period = Path(period_path).read_text().strip()
+            quota_cpus = max(1, int(quota) // int(period))
+            cpu_count = min(cpu_count, quota_cpus)
+        except (OSError, ValueError, ZeroDivisionError):
+            continue
+    return max(1, cpu_count)
+
+
+def _get_available_memory_bytes() -> int | None:
+    available = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                available = int(line.split()[1]) * 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+
+    if available is None:
+        try:
+            available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        except (OSError, ValueError):
+            return None
+
+    for limit_path, usage_path in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            limit_text = Path(limit_path).read_text().strip()
+            if limit_text == "max":
+                continue
+            limit = int(limit_text)
+            if limit >= 1 << 60:
+                continue
+            usage = int(Path(usage_path).read_text().strip())
+            available = min(available, max(0, limit - usage))
+        except (OSError, ValueError):
+            continue
+    return available
+
+
+def calculate_worker_count(
+    model_name: str,
+    cpu_count: int,
+    available_memory_bytes: int | None,
+) -> int:
+    """Оценивает число одновременных транскрибаций по CPU и свободной RAM."""
+    if available_memory_bytes is None:
+        return 1
+
+    model_key = get_effective_model_name(model_name).lower().split("/")[-1]
+    for name in sorted(_WORKER_MEMORY_GIB, key=len, reverse=True):
+        if name in model_key:
+            worker_memory = _WORKER_MEMORY_GIB[name] * _GIB
+            break
+    else:
+        worker_memory = _WORKER_MEMORY_GIB["medium"] * _GIB
+
+    memory_reserve = _GIB
+    memory_workers = max(1, int(max(0, available_memory_bytes - memory_reserve) // worker_memory))
+    return max(1, min(max(1, cpu_count), memory_workers))
+
+
+def get_worker_count(model_name: str) -> int:
+    automatic = calculate_worker_count(
+        model_name,
+        cpu_count=_get_cpu_count(),
+        available_memory_bytes=_get_available_memory_bytes(),
+    )
+    configured = os.getenv("WHISPER_WORKERS", "auto").strip().lower()
+    if configured in {"", "auto"}:
+        return automatic
+    try:
+        requested = int(configured)
+    except ValueError:
+        log.warning("Некорректное значение WHISPER_WORKERS=%r; использую авторасчёт", configured)
+        return automatic
+    return min(automatic, max(1, requested))
 
 
 def clear_model() -> None:
@@ -69,10 +178,7 @@ def build_chunk_ranges(duration: float, chunk_seconds: int = 600) -> list[tuple[
 def get_model(model_name: str):
     global _model, _model_name, _model_workers
     effective_model = get_effective_model_name(model_name)
-    try:
-        workers = max(1, min(int(os.getenv("WHISPER_WORKERS", "1")), 4))
-    except ValueError:
-        workers = 1
+    workers = get_worker_count(effective_model)
     if _model is None or _model_name != effective_model or _model_workers != workers:
         from faster_whisper import WhisperModel
         log.info(f"Загрузка модели {effective_model} (потоки: {workers})...")
@@ -81,9 +187,17 @@ def get_model(model_name: str):
             device="cpu",
             compute_type="int8",
             num_workers=workers,
+            cpu_threads=max(1, _get_cpu_count() // workers),
         )
         _model_name = effective_model
         _model_workers = workers
+        log.info(
+            "Для модели %s выбрано %s ворк. (CPU: %s, доступно RAM: %.1f ГБ)",
+            effective_model,
+            workers,
+            _get_cpu_count(),
+            (_get_available_memory_bytes() or 0) / _GIB,
+        )
         log.info("Модель загружена.")
     return _model
 

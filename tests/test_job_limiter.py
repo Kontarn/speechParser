@@ -59,6 +59,22 @@ class JobLimiterTests(unittest.TestCase):
         self.assertEqual(ranges[0], (0.0, 600.0))
         self.assertEqual(ranges[-1][1], 3700.0)
 
+    def test_worker_count_is_limited_by_available_memory(self):
+        workers = pipeline.calculate_worker_count(
+            "medium",
+            cpu_count=12,
+            available_memory_bytes=int(1.6 * pipeline._GIB),
+        )
+        self.assertEqual(workers, 1)
+
+    def test_worker_count_uses_cpu_and_memory_capacity(self):
+        workers = pipeline.calculate_worker_count(
+            "small",
+            cpu_count=4,
+            available_memory_bytes=8 * pipeline._GIB,
+        )
+        self.assertEqual(workers, 4)
+
 
 if __name__ == "__main__":
     unittest.main()
