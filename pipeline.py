@@ -353,15 +353,15 @@ def transcribe_file(
         log.info(f"Длительность файла {file_duration:.0f}s превышает лимит чанка, разбиваем на {len(ranges)} частей")
         tmp_dir = tempfile.mkdtemp(prefix="chunks_", dir=BASE_DIR)
         try:
-            chunk_files: list[str] = []
-            for i, (start, end) in enumerate(ranges, start=1):
-                chunk_path = os.path.join(tmp_dir, f"chunk_{i:03d}.wav")
+            def extract_chunk(index: int, start: float, end: float) -> str:
+                chunk_path = os.path.join(tmp_dir, f"chunk_{index:03d}.wav")
                 subprocess.run(
                     [
                         "ffmpeg", "-y",
-                        "-i", input_path,
                         "-ss", str(start),
-                        "-to", str(end),
+                        "-threads", "1",
+                        "-i", input_path,
+                        "-t", str(end - start),
                         "-vn",
                         "-acodec", "pcm_s16le",
                         "-ar", "16000",
@@ -372,9 +372,18 @@ def transcribe_file(
                     text=True,
                     check=False,
                 )
-                if not os.path.exists(chunk_path):
+                if not os.path.exists(chunk_path) or os.path.getsize(chunk_path) == 0:
                     raise RuntimeError(f"Не удалось создать чанк {chunk_path}")
-                chunk_files.append(chunk_path)
+                return chunk_path
+
+            extract_workers = min(_get_cpu_count(), len(ranges))
+            log.info("Нарезаю аудио на %s чанков параллельно (FFmpeg-процессов: %s)", len(ranges), extract_workers)
+            with ThreadPoolExecutor(max_workers=extract_workers) as executor:
+                extraction_futures = [
+                    executor.submit(extract_chunk, index, start, end)
+                    for index, (start, end) in enumerate(ranges, start=1)
+                ]
+                chunk_files = [future.result() for future in extraction_futures]
 
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write("")

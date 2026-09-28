@@ -1,4 +1,7 @@
+import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 import bot
@@ -74,6 +77,44 @@ class JobLimiterTests(unittest.TestCase):
             cpu_threads=8,
         )
         pipeline.clear_model()
+
+    def test_audio_chunks_are_extracted_in_parallel_and_ordered(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = Path(temp_dir) / "source.m4a"
+            output_path = Path(temp_dir) / "transcript.txt"
+            input_path.touch()
+            max_workers_used = []
+            original_executor = pipeline.ThreadPoolExecutor
+
+            def create_executor(max_workers):
+                max_workers_used.append(max_workers)
+                return original_executor(max_workers=max_workers)
+
+            def fake_ffmpeg(command, **kwargs):
+                Path(command[-1]).write_bytes(b"wav")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            def fake_get_model(model_name, workers=None):
+                pipeline._model_workers = workers
+                return object()
+
+            def fake_transcribe_one_file(input_path, model_name, output_path, **kwargs):
+                Path(output_path).write_text(f"part{kwargs['chunk_number']}\n", encoding="utf-8")
+
+            with (
+                patch.object(pipeline, "BASE_DIR", Path(temp_dir)),
+                patch.object(pipeline, "get_media_duration", return_value=1201),
+                patch.object(pipeline, "_get_cpu_count", return_value=4),
+                patch.object(pipeline, "get_worker_count", return_value=4),
+                patch.object(pipeline, "get_model", side_effect=fake_get_model),
+                patch.object(pipeline, "_transcribe_one_file", side_effect=fake_transcribe_one_file),
+                patch.object(pipeline.subprocess, "run", side_effect=fake_ffmpeg),
+                patch.object(pipeline, "ThreadPoolExecutor", side_effect=create_executor),
+            ):
+                pipeline.transcribe_file(str(input_path), "medium", str(output_path))
+
+            self.assertEqual(max_workers_used, [3, 3])
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "part1\npart2\npart3\n")
 
     def test_build_chunk_ranges(self):
         ranges = pipeline.build_chunk_ranges(3700, chunk_seconds=600)
