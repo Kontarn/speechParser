@@ -313,7 +313,7 @@ def _transcribe_one_file(
         for segment in segments:
             start = chunk_offset + segment.start
             end = chunk_offset + segment.end
-            line = f"[{format_timestamp(start)} --> {format_timestamp(end)}] {segment.text.strip()}"
+            line = segment.text.strip()
             f.write(line + "\n")
             f.flush()
             log.debug(line)
@@ -437,7 +437,7 @@ def transcribe_file(
 
         with open(output_path, "w", encoding="utf-8") as f:
             for segment in segments:
-                line = f"[{format_timestamp(segment.start)} --> {format_timestamp(segment.end)}] {segment.text.strip()}"
+                line = segment.text.strip()
                 f.write(line + "\n")
                 f.flush()
                 log.debug(line)

@@ -38,7 +38,6 @@ def transcribe(input_path: str, model_name: str, language: str | None) -> None:
         sys.exit(1)
 
     output_path = os.path.splitext(input_path)[0] + ".txt"
-    srt_path = os.path.splitext(input_path)[0] + ".srt"
 
     log.info(f"Загрузка модели {model_name}...")
     try:
@@ -65,26 +64,15 @@ def transcribe(input_path: str, model_name: str, language: str | None) -> None:
     log.info(f"Определён язык: {info.language} (вероятность {info.language_probability:.0%})")
     log.info(f"Длительность: {format_timestamp(info.duration)}")
 
-    with open(output_path, "w", encoding="utf-8") as txt_f, \
-         open(srt_path, "w", encoding="utf-8") as srt_f:
-
-        for i, segment in enumerate(segments, start=1):
-            # .txt с таймстампами
-            line = f"[{format_timestamp(segment.start)} --> {format_timestamp(segment.end)}] {segment.text.strip()}"
+    with open(output_path, "w", encoding="utf-8") as txt_f:
+        for segment in segments:
+            line = segment.text.strip()
             txt_f.write(line + "\n")
             print(line)
-
-            # .srt субтитры
-            srt_f.write(f"{i}\n")
-            srt_f.write(
-                f"{format_timestamp(segment.start)},000 --> {format_timestamp(segment.end)},000\n"
-            )
-            srt_f.write(segment.text.strip() + "\n\n")
 
     elapsed = time.time() - start
     log.info(f"Готово за {format_timestamp(elapsed)}")
     log.info(f"Текст:     {output_path}")
-    log.info(f"Субтитры:  {srt_path}")
 
 
 def main() -> None:
