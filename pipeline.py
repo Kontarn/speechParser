@@ -179,15 +179,22 @@ def get_model(model_name: str):
     global _model, _model_name, _model_workers
     effective_model = get_effective_model_name(model_name)
     workers = get_worker_count(effective_model)
+    cpu_count = _get_cpu_count()
+    cpu_threads = max(1, cpu_count // workers)
     if _model is None or _model_name != effective_model or _model_workers != workers:
         from faster_whisper import WhisperModel
-        log.info(f"Загрузка модели {effective_model} (потоки: {workers})...")
+        log.info(
+            "Загрузка модели %s (параллельных вызовов: %s, CPU-потоков на вызов: %s)...",
+            effective_model,
+            workers,
+            cpu_threads,
+        )
         _model = WhisperModel(
             effective_model,
             device="cpu",
             compute_type="int8",
             num_workers=workers,
-            cpu_threads=max(1, _get_cpu_count() // workers),
+            cpu_threads=cpu_threads,
         )
         _model_name = effective_model
         _model_workers = workers
@@ -195,7 +202,7 @@ def get_model(model_name: str):
             "Для модели %s выбрано %s ворк. (CPU: %s, доступно RAM: %.1f ГБ)",
             effective_model,
             workers,
-            _get_cpu_count(),
+            cpu_count,
             (_get_available_memory_bytes() or 0) / _GIB,
         )
         log.info("Модель загружена.")
