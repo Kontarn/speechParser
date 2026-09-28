@@ -1,13 +1,14 @@
 services:
-  bot:
+  processor:
     build: .
     restart: unless-stopped
-    env_file: .env
+    env_file: .env.server
+    ports:
+      - "127.0.0.1:8080:8080"
     volumes:
-      # Кэш моделей Whisper — чтобы не скачивать каждый раз при пересборке
       - whisper_cache:/root/.cache/huggingface
-      # Логи
-      - ./logs:/app/logs
+      - processor_data:/app/tmp
 
 volumes:
   whisper_cache:
+  processor_data:

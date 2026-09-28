@@ -2,9 +2,13 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
-.env
+.env*
+!.env.example
+!.env.server.example
 logs/
 *.mp4
 *.mp3
 *.txt
 *.srt
+!requirements.txt
+!requirements-worker.txt

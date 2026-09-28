@@ -461,23 +461,24 @@ def run_pipeline_file(
     input_path: str,
     model_name: str,
     update_status: Callable[[str], None],
+    output_path: Optional[str] = None,
 ) -> str:
     """
     Пайплайн для уже скачанного файла: транскрибировать → вернуть путь к .txt.
     """
-    output_dir = BASE_DIR / "results"
-    output_dir.mkdir(exist_ok=True)
-
-    stem = Path(input_path).stem
-    transcript_path = str(output_dir / f"transcript_{stem}.txt")
+    if output_path is None:
+        output_dir = BASE_DIR / "results"
+        output_dir.mkdir(exist_ok=True)
+        stem = Path(input_path).stem
+        output_path = str(output_dir / f"transcript_{stem}.txt")
 
     update_status(f"🎙 Транскрибирую...")
     try:
-        transcribe_file(input_path, model_name, transcript_path, update_status)
+        transcribe_file(input_path, model_name, output_path, update_status)
     finally:
         clear_model()
 
-    return transcript_path
+    return output_path
 
 
 def run_pipeline(
@@ -485,6 +486,7 @@ def run_pipeline(
     model_name: str,
     session_id: Optional[str],
     update_status: Callable[[str], None],
+    output_path: Optional[str] = None,
 ) -> str:
     """
     Полный пайплайн: скачать → транскрибировать → вернуть путь к .txt.
@@ -499,7 +501,7 @@ def run_pipeline(
 
     output_dir = BASE_DIR / "results"
     output_dir.mkdir(exist_ok=True)
-    final_path = str(output_dir / f"transcript_{event_session_id}.txt")
+    final_path = output_path or str(output_dir / f"transcript_{event_session_id}.txt")
     Path(final_path).write_text("", encoding="utf-8")
 
     work_dir = tempfile.mkdtemp(prefix="job_", dir=BASE_DIR)

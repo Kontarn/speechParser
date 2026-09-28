@@ -9,20 +9,19 @@ Telegram бот для транскрибации.
 
 import asyncio
 import logging
-import multiprocessing
 import os
-import queue
 import tempfile
 import threading
 import time
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from pipeline import BASE_DIR, parse_mts_url, run_pipeline, run_pipeline_file
+from pipeline import BASE_DIR, parse_mts_url
 
 load_dotenv()
 
@@ -48,8 +47,10 @@ def _env_int(name: str, default: int = 0) -> int:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ALLOWED_USER_ID = _env_int("ALLOWED_USER_ID", 0)
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
-MTS_SESSION_ID = os.getenv("MTS_SESSION_ID", "")
+PROCESSOR_URL = os.getenv("PROCESSOR_URL", "").rstrip("/")
+PROCESSOR_API_KEY = os.getenv("PROCESSOR_API_KEY", "")
 TRANSCRIPTION_TIMEOUT_SECONDS = _env_int("TRANSCRIPTION_TIMEOUT_SECONDS", 3 * 60 * 60)
+REMOTE_POLL_INTERVAL_SECONDS = 2
 
 MTS_LINK_PREFIX = "https://my.mts-link.ru/"
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB — лимит скачивания через облачный Telegram Bot API
@@ -64,83 +65,65 @@ class TranscriptionCancelled(Exception):
     """Пайплайн остановлен пользователем, частичный результат можно отправить."""
 
 
-def _pipeline_process_target(kind, args, status_queue, result_queue) -> None:
-    """Запускает пайплайн в отдельном процессе, который можно принудительно остановить."""
-    def process_status(text: str) -> None:
-        status_queue.put(text)
+def _run_pipeline_with_timeout(kind: str, args: tuple, update_status, job_id: str | None = None) -> str:
+    if not PROCESSOR_URL or not PROCESSOR_API_KEY:
+        raise RuntimeError("Задай PROCESSOR_URL и PROCESSOR_API_KEY для удалённого обработчика")
 
-    try:
-        if kind == "file":
-            result = run_pipeline_file(
-                input_path=args[0],
-                model_name=args[1],
-                update_status=process_status,
+    headers = {"Authorization": f"Bearer {PROCESSOR_API_KEY}"}
+    timeout = httpx.Timeout(TRANSCRIPTION_TIMEOUT_SECONDS, connect=30.0)
+    output_path = get_transcript_path("url" if kind == "url" else "file", args)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with httpx.Client(timeout=timeout, headers=headers) as client:
+        if kind == "url":
+            response = client.post(
+                f"{PROCESSOR_URL}/jobs",
+                json={"url": args[0], "model": args[1]},
             )
         else:
-            result = run_pipeline(
-                url=args[0],
-                model_name=args[1],
-                session_id=args[2],
-                update_status=process_status,
-            )
-        result_queue.put(("result", result))
-    except Exception as error:
-        result_queue.put(("error", f"{type(error).__name__}: {error}"))
+            input_path, model_name = args
+            with open(input_path, "rb") as input_file:
+                response = client.post(
+                    f"{PROCESSOR_URL}/jobs/file",
+                    params={"filename": Path(input_path).name, "model": model_name},
+                    content=input_file,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+        response.raise_for_status()
+        remote_job_id = response.json()["job_id"]
+        if job_id and job_id in JOB_STATUS:
+            JOB_STATUS[job_id]["remote_job_id"] = remote_job_id
 
+        deadline = time.monotonic() + TRANSCRIPTION_TIMEOUT_SECONDS
+        cancel_sent = False
+        last_status = None
+        while time.monotonic() < deadline:
+            if job_id and JOB_STATUS.get(job_id, {}).get("cancel_requested") and not cancel_sent:
+                client.delete(f"{PROCESSOR_URL}/jobs/{remote_job_id}").raise_for_status()
+                cancel_sent = True
 
-def _run_pipeline_with_timeout(kind: str, args: tuple, update_status, job_id: str | None = None) -> str:
-    context = multiprocessing.get_context("spawn")
-    status_queue = context.Queue()
-    result_queue = context.Queue()
-    process = context.Process(
-        target=_pipeline_process_target,
-        args=(kind, args, status_queue, result_queue),
-        daemon=True,
-    )
-    process.start()
-    if job_id and job_id in JOB_STATUS:
-        JOB_STATUS[job_id]["process"] = process
-    deadline = time.monotonic() + TRANSCRIPTION_TIMEOUT_SECONDS
+            response = client.get(f"{PROCESSOR_URL}/jobs/{remote_job_id}")
+            response.raise_for_status()
+            status = response.json()
+            if status.get("message") and status["message"] != last_status:
+                update_status(status["message"])
+                last_status = status["message"]
 
-    while process.is_alive():
-        if job_id and JOB_STATUS.get(job_id, {}).get("cancel_requested"):
-            process.terminate()
-            process.join(timeout=10)
-            if process.is_alive():
-                process.kill()
-                process.join()
-            raise TranscriptionCancelled
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            process.terminate()
-            process.join(timeout=10)
-            if process.is_alive():
-                process.kill()
-                process.join()
-            raise TimeoutError(
-                f"Превышено время обработки ({TRANSCRIPTION_TIMEOUT_SECONDS // 3600} ч.)"
-            )
-        try:
-            update_status(status_queue.get(timeout=min(1, remaining)))
-        except queue.Empty:
-            pass
+            if status["status"] in {"completed", "cancelled"}:
+                result_response = client.get(f"{PROCESSOR_URL}/jobs/{remote_job_id}/result")
+                if result_response.status_code == 200:
+                    output_path.write_bytes(result_response.content)
+                elif status["status"] == "completed":
+                    result_response.raise_for_status()
+                if status["status"] == "cancelled":
+                    raise TranscriptionCancelled
+                return str(output_path)
+            if status["status"] == "failed":
+                raise RuntimeError(status.get("error") or "Удалённый обработчик завершился с ошибкой")
+            time.sleep(REMOTE_POLL_INTERVAL_SECONDS)
 
-    process.join()
-    if job_id and JOB_STATUS.get(job_id, {}).get("cancel_requested"):
-        raise TranscriptionCancelled
-    while True:
-        try:
-            update_status(status_queue.get_nowait())
-        except queue.Empty:
-            break
-
-    try:
-        result_type, result = result_queue.get(timeout=1)
-    except queue.Empty as error:
-        raise RuntimeError(f"Процесс обработки завершился без результата (код {process.exitcode})") from error
-    if result_type == "error":
-        raise RuntimeError(result)
-    return result
+        client.delete(f"{PROCESSOR_URL}/jobs/{remote_job_id}")
+        raise TimeoutError(f"Превышено время обработки ({TRANSCRIPTION_TIMEOUT_SECONDS // 3600} ч.)")
 
 
 def _send_processing_failure(bot, chat_id: int, status_message_id: int, text: str, main_loop) -> None:
@@ -303,7 +286,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"Текущая модель: {WHISPER_MODEL}\n"
         "Время обработки: ~40–90 мин для 2-часовой записи.\n"
-        "Результат придёт .txt файлом с таймстампами.\n\n"
+        "Результат придёт .txt файлом без таймкодов.\n\n"
         "Чтобы остановить текущую расшифровку и получить готовую часть, отправь /stop.\n\n"
         "Что принимаю:\n"
         "• Ссылку https://my.mts-link.ru/...\n"
@@ -338,9 +321,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             stopped_queued = True
             continue
         job["cancel_requested"] = True
-        process = job.get("process")
-        if process and process.is_alive():
-            process.terminate()
         stopped_running = True
 
     if stopped_running:
@@ -376,7 +356,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             transcript_path = _run_pipeline_with_timeout(
                 "url",
-                (text, WHISPER_MODEL, MTS_SESSION_ID or None),
+                (text, WHISPER_MODEL),
                 update_status,
                 job_id,
             )
@@ -386,7 +366,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 context.bot,
                 update.effective_chat.id,
                 status_msg.message_id,
-                get_transcript_path("url", (text, WHISPER_MODEL, MTS_SESSION_ID or None)),
+                get_transcript_path("url", (text, WHISPER_MODEL)),
                 main_loop,
             )
         except Exception as e:
@@ -556,6 +536,8 @@ def main() -> None:
         raise RuntimeError("BOT_TOKEN не задан в .env")
     if not ALLOWED_USER_ID:
         raise RuntimeError("ALLOWED_USER_ID не задан в .env")
+    if not PROCESSOR_URL or not PROCESSOR_API_KEY:
+        raise RuntimeError("PROCESSOR_URL и PROCESSOR_API_KEY должны быть заданы в .env")
 
     app = Application.builder().token(BOT_TOKEN).build()
 

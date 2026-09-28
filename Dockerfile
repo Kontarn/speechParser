@@ -8,17 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Устанавливаем Python зависимости
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Устанавливаем mtslinker напрямую с GitHub
-RUN pip install --no-cache-dir git+https://github.com/motattack/mtslinker.git
+# Устанавливаем зависимости только удалённого обработчика
+COPY requirements-worker.txt .
+RUN pip install --no-cache-dir -r requirements-worker.txt
 
 # Копируем исходники
-COPY bot.py pipeline.py transcribe.py audio_downloader.py ./
+COPY worker_server.py pipeline.py audio_downloader.py ./
 
-# Директория для временных результатов транскрибации
-RUN mkdir -p /tmp/speechparser_results
+RUN mkdir -p /app/tmp
 
-CMD ["python", "bot.py"]
+EXPOSE 8080
+CMD ["python", "worker_server.py"]
