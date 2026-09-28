@@ -53,6 +53,31 @@ python bot.py
 
 В `.env` задай `BOT_TOKEN`, `ALLOWED_USER_ID`, `PROCESSOR_URL` (адрес VPS с HTTPS) и тот же `PROCESSOR_API_KEY`, что указан на сервере. `WHISPER_MODEL` выбирает модель, которую будет использовать удалённый обработчик.
 
+### Запуск обработчика без Docker
+
+На VPS с Debian/Ubuntu установи системные FFmpeg-инструменты: `ffmpeg` и `ffprobe` нужны для проверки и извлечения аудио.
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg git
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements-worker.txt
+cp .env.server.example .env.server
+chmod 600 .env.server
+```
+
+Заполни `.env.server`, затем запусти worker с переменными из этого файла:
+
+```bash
+set -a
+source .env.server
+set +a
+python worker_server.py
+```
+
+Убедись, что обе команды находятся в `PATH`: `command -v ffmpeg` и `command -v ffprobe`.
+
 Для фоновой работы бота можно использовать `tmux`:
 
 ```bash

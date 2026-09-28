@@ -366,6 +366,12 @@ class ProcessorHandler(BaseHTTPRequestHandler):
 def main() -> None:
     if not API_KEY:
         raise RuntimeError("PROCESSOR_API_KEY не задан")
+    missing_tools = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing_tools:
+        raise RuntimeError(
+            f"Не найдены системные программы: {', '.join(missing_tools)}. "
+            "Установи пакет ffmpeg (он включает ffprobe) и перезапусти обработчик."
+        )
     _cleanup_expired_jobs()
     server = ThreadingHTTPServer((HOST, PORT), ProcessorHandler)
     log.info("Удалённый обработчик запущен на %s:%s; одновременно заданий: %s", HOST, PORT, MAX_CONCURRENT_JOBS)
