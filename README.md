@@ -36,7 +36,26 @@ processor.example.com {
 }
 ```
 
-В `PROCESSOR_URL` на локальном компьютере укажи публичный HTTPS-домен. Не открывай порт `8080` напрямую в интернет: API-ключ защищает запросы, но не шифрует передаваемые аудио и ключ.
+Если собственного домена нет, можно использовать Tailscale Serve. Установи Tailscale и подключи VPS и компьютер с ботом к одной tailnet-сети. На VPS выполни:
+
+```bash
+sudo tailscale serve --bg http://127.0.0.1:8080
+tailscale serve status
+```
+
+Tailscale покажет HTTPS-адрес VPS вида `https://имя-машины.имя-сети.ts.net`. Укажи его в `PROCESSOR_URL` в локальном `.env`. Этот адрес доступен только устройствам той же tailnet-сети, поэтому Tailscale должен быть подключён и на VPS, и на компьютере с ботом.
+
+На компьютере с ботом установи клиент Tailscale. Для Ubuntu и Debian:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+tailscale status
+```
+
+Открой ссылку, показанную командой `tailscale up`, и войди в ту же tailnet, что и на VPS. Если VPS добавлен в tailnet под другим аккаунтом, администратор этой сети должен пригласить аккаунт компьютера. В выводе `tailscale status` должны отображаться оба устройства. Для Windows и macOS установщик доступен на [странице загрузки Tailscale](https://tailscale.com/download).
+
+При использовании Caddy укажи в `PROCESSOR_URL` публичный HTTPS-домен. Не открывай порт `8080` напрямую в интернет: API-ключ защищает запросы, но не шифрует передаваемые аудио и ключ.
 
 Whisper-модель кэшируется в Docker volume `whisper_cache`, а файлы заданий — в `processor_data`.
 
