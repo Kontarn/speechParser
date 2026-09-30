@@ -113,8 +113,9 @@ class JobLimiterTests(unittest.TestCase):
             ):
                 pipeline.transcribe_file(str(input_path), "medium", str(output_path))
 
-            self.assertEqual(max_workers_used, [3, 3])
-            self.assertEqual(output_path.read_text(encoding="utf-8"), "part1\npart2\npart3\n")
+            self.assertEqual(max_workers_used, [4, 4])
+            expected_output = "".join(f"part{part}\n" for part in range(1, 12))
+            self.assertEqual(output_path.read_text(encoding="utf-8"), expected_output)
 
     def test_build_chunk_ranges(self):
         ranges = pipeline.build_chunk_ranges(3700, chunk_seconds=600)

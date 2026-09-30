@@ -35,6 +35,7 @@ MTS_URL_PATTERN = re.compile(
 _model = None
 _model_name: Optional[str] = None
 _model_workers = 1
+TRANSCRIPTION_CHUNK_SECONDS = 120
 _GIB = 1024 ** 3
 _WORKER_MEMORY_GIB = {
     "tiny": 0.6,
@@ -344,10 +345,10 @@ def transcribe_file(
 ) -> str:
     """
     Транскрибирует файл через faster-whisper.
-    Для длинных записей разбивает на чанки по 10 минут, чтобы уменьшить пик памяти и нагрузку.
+    Для длинных записей разбивает аудио на короткие задачи для равномерной загрузки workers.
     """
     file_duration = get_media_duration(input_path)
-    ranges = build_chunk_ranges(file_duration, chunk_seconds=600)
+    ranges = build_chunk_ranges(file_duration, chunk_seconds=TRANSCRIPTION_CHUNK_SECONDS)
 
     if len(ranges) > 1:
         log.info(f"Длительность файла {file_duration:.0f}s превышает лимит чанка, разбиваем на {len(ranges)} частей")
