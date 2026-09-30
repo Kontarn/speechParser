@@ -81,7 +81,7 @@ sudo apt update
 sudo apt install -y python3 python3-venv python3-pip ffmpeg git
 python3 -m venv venv
 source venv/bin/activate
-python -m pip install -r requirements-worker.txt
+python -m pip install -r requirements.txt
 cp .env.server.example .env.server
 chmod 600 .env.server
 ```
