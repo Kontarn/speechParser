@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 
 from pipeline import BASE_DIR, parse_mts_url, run_pipeline, run_pipeline_file
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().with_name(".env.server"))
 
 logging.basicConfig(
     level=logging.INFO,
