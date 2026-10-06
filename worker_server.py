@@ -30,7 +30,7 @@ logging.basicConfig(
 log = logging.getLogger("worker_server")
 
 API_KEY = os.getenv("PROCESSOR_API_KEY", "")
-HOST = os.getenv("PROCESSOR_HOST", "0.0.0.0")
+HOST = os.getenv("PROCESSOR_HOST", "127.0.0.1")
 PORT = int(os.getenv("PROCESSOR_PORT", "8080"))
 MTS_SESSION_ID = os.getenv("MTS_SESSION_ID", "")
 DEFAULT_MODEL = os.getenv("WHISPER_MODEL", "medium")

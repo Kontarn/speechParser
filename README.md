@@ -11,24 +11,51 @@ Telegram-бот для расшифровки записей МТС Линк и 
 
 ## Обработчик на VPS
 
-На сервере установи Docker и Docker Compose, затем клонируй репозиторий. Создай конфигурацию обработчика:
+На VPS с Debian/Ubuntu установи Python, Git и FFmpeg, затем клонируй репозиторий. В каталоге проекта создай виртуальное окружение и установи зависимости:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg git
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Создай конфигурацию обработчика и закрой доступ к ней для других пользователей системы:
 
 ```bash
 cp .env.server.example .env.server
+chmod 600 .env.server
 openssl rand -hex 32
 nano .env.server
 ```
 
-Впиши созданный секрет в `PROCESSOR_API_KEY`. Для приватных записей добавь cookie `access` в `MTS_SESSION_ID`. Значение API-ключа потребуется также в локальном `.env`.
+Впиши созданный секрет в `PROCESSOR_API_KEY`. Для приватных записей добавь cookie `access` в `MTS_SESSION_ID`. Оставь `PROCESSOR_HOST=127.0.0.1`, чтобы API принимал соединения только с самого VPS; значение API-ключа потребуется также в локальном `.env`.
 
-Собери и запусти обработчик:
+Запусти обработчик из активированного виртуального окружения:
 
 ```bash
-docker compose up -d --build
-docker compose logs -f processor
+set -a
+source .env.server
+set +a
+python worker_server.py
 ```
 
-Compose публикует API только на `127.0.0.1:8080`. Настрой HTTPS reverse proxy на VPS с upstream `127.0.0.1:8080`, например для Caddy:
+Проверь, что `ffmpeg` и `ffprobe` доступны через `PATH`: `command -v ffmpeg` и `command -v ffprobe`.
+
+### Подключение бота через SSH-туннель
+
+На компьютере, где запущен бот, открой SSH-туннель к VPS:
+
+```bash
+ssh -N -L 18080:127.0.0.1:8080 vps_sp
+```
+
+Здесь `vps_sp` — SSH alias из `~/.ssh/config`. Оставь туннель запущенным и укажи в локальном `.env` `PROCESSOR_URL=http://127.0.0.1:18080`. Передача между компьютером и VPS идёт внутри SSH-соединения.
+
+### Другие способы подключения
+
+Если у VPS есть домен, можно настроить HTTPS reverse proxy, например Caddy:
 
 ```caddy
 processor.example.com {
@@ -36,7 +63,7 @@ processor.example.com {
 }
 ```
 
-Если собственного домена нет, можно использовать Tailscale Serve. Установи Tailscale и подключи VPS и компьютер с ботом к одной tailnet-сети. На VPS выполни:
+Без собственного домена можно использовать Tailscale Serve: подключи VPS и компьютер с ботом к одной tailnet-сети, затем на VPS выполни:
 
 ```bash
 sudo tailscale serve --bg http://127.0.0.1:8080
@@ -57,8 +84,6 @@ tailscale status
 
 При использовании Caddy укажи в `PROCESSOR_URL` публичный HTTPS-домен. Не открывай порт `8080` напрямую в интернет: API-ключ защищает запросы, но не шифрует передаваемые аудио и ключ.
 
-Whisper-модель кэшируется в Docker volume `whisper_cache`, а файлы заданий — в `processor_data`.
-
 ## Локальный бот
 
 ```bash
@@ -71,31 +96,6 @@ python bot.py
 ```
 
 В `.env` задай `BOT_TOKEN`, `ALLOWED_USER_ID`, `PROCESSOR_URL` (адрес VPS с HTTPS) и тот же `PROCESSOR_API_KEY`, что указан на сервере. `WHISPER_MODEL` выбирает модель, которую будет использовать удалённый обработчик.
-
-### Запуск обработчика без Docker
-
-На VPS с Debian/Ubuntu установи системные FFmpeg-инструменты: `ffmpeg` и `ffprobe` нужны для проверки и извлечения аудио.
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip ffmpeg git
-python3 -m venv venv
-source venv/bin/activate
-python -m pip install -r requirements.txt
-cp .env.server.example .env.server
-chmod 600 .env.server
-```
-
-Заполни `.env.server`, затем запусти worker с переменными из этого файла:
-
-```bash
-set -a
-source .env.server
-set +a
-python worker_server.py
-```
-
-Убедись, что обе команды находятся в `PATH`: `command -v ffmpeg` и `command -v ffprobe`.
 
 Для фоновой работы бота можно использовать `tmux`:
 
