@@ -78,12 +78,33 @@ class JobLimiterTests(unittest.TestCase):
         )
         pipeline.clear_model()
 
+    def test_parallel_model_workers_round_up_cpu_threads(self):
+        whisper_model = Mock(return_value=object())
+        fake_module = Mock(WhisperModel=whisper_model)
+        pipeline.clear_model()
+
+        with (
+            patch.dict("sys.modules", {"faster_whisper": fake_module}),
+            patch.object(pipeline, "_get_cpu_count", return_value=16),
+        ):
+            pipeline.get_model("large-v3", workers=7)
+
+        whisper_model.assert_called_once_with(
+            "large-v3",
+            device="cpu",
+            compute_type="int8",
+            num_workers=7,
+            cpu_threads=3,
+        )
+        pipeline.clear_model()
+
     def test_audio_chunks_are_extracted_in_parallel_and_ordered(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = Path(temp_dir) / "source.m4a"
             output_path = Path(temp_dir) / "transcript.txt"
             input_path.touch()
             max_workers_used = []
+            status_updates = []
             original_executor = pipeline.ThreadPoolExecutor
 
             def create_executor(max_workers):
@@ -111,11 +132,15 @@ class JobLimiterTests(unittest.TestCase):
                 patch.object(pipeline.subprocess, "run", side_effect=fake_ffmpeg),
                 patch.object(pipeline, "ThreadPoolExecutor", side_effect=create_executor),
             ):
-                pipeline.transcribe_file(str(input_path), "medium", str(output_path))
+                pipeline.transcribe_file(
+                    str(input_path), "medium", str(output_path), status_updates.append
+                )
 
             self.assertEqual(max_workers_used, [4, 4])
             expected_output = "".join(f"part{part}\n" for part in range(1, 12))
             self.assertEqual(output_path.read_text(encoding="utf-8"), expected_output)
+            self.assertEqual(status_updates[0], "🎙 Готово частей: 0/11 · 0,0/20,0 мин")
+            self.assertEqual(status_updates[-1], "🎙 Готово частей: 11/11 · 20,0/20,0 мин")
 
     def test_build_chunk_ranges(self):
         ranges = pipeline.build_chunk_ranges(3700, chunk_seconds=600)

@@ -1,10 +1,11 @@
+import asyncio
 import threading
 import tempfile
 import unittest
 import uuid
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import bot
 import worker_server
@@ -21,6 +22,46 @@ class RemoteProcessingTests(unittest.TestCase):
         job = worker_server.JOBS[job_id]
         Path(job["output_path"]).write_text("Удалённая расшифровка\n", encoding="utf-8")
         worker_server._set_job(job_id, status="completed", message="Расшифровка готова.")
+
+    def test_ping_reports_worker_available(self):
+        server, server_thread = self._start_server()
+        message = Mock()
+        message.reply_text = AsyncMock()
+        update = Mock(message=message, effective_message=message)
+
+        try:
+            with (
+                patch.object(bot, "PROCESSOR_URL", f"http://127.0.0.1:{server.server_port}"),
+                patch.object(bot, "check_access", return_value=True),
+            ):
+                asyncio.run(bot.cmd_ping(update, Mock()))
+
+            self.assertRegex(
+                message.reply_text.await_args.args[0],
+                r"^✅ Обработчик доступен \(\d+ мс\)\.$",
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+            server_thread.join(timeout=2)
+
+    def test_ping_reports_worker_unavailable(self):
+        server, server_thread = self._start_server()
+        server_port = server.server_port
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
+
+        message = Mock()
+        message.reply_text = AsyncMock()
+        update = Mock(message=message, effective_message=message)
+        with (
+            patch.object(bot, "PROCESSOR_URL", f"http://127.0.0.1:{server_port}"),
+            patch.object(bot, "check_access", return_value=True),
+        ):
+            asyncio.run(bot.cmd_ping(update, Mock()))
+
+        self.assertTrue(message.reply_text.await_args.args[0].startswith("❌ Обработчик недоступен:"))
 
     def test_bot_submits_job_and_downloads_result(self):
         server, server_thread = self._start_server()

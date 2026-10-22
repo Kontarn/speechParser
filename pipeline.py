@@ -6,7 +6,7 @@
 """
 
 import gc
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import re
@@ -181,7 +181,7 @@ def get_model(model_name: str, workers: Optional[int] = None):
     effective_model = get_effective_model_name(model_name)
     workers = get_worker_count(effective_model) if workers is None else max(1, workers)
     cpu_count = _get_cpu_count()
-    cpu_threads = max(1, cpu_count // workers)
+    cpu_threads = max(1, (cpu_count + workers - 1) // workers)
     if _model is None or _model_name != effective_model or _model_workers != workers:
         from faster_whisper import WhisperModel
         log.info(
@@ -288,19 +288,18 @@ def download_recording_full(
     return result_path
 
 
+def _format_minutes(seconds: float) -> str:
+    return f"{seconds / 60:.1f}".replace(".", ",")
+
+
 def _transcribe_one_file(
     input_path: str,
     model_name: str,
     output_path: str,
-    update_status: Optional[Callable[[str], None]] = None,
-    chunk_offset: float = 0.0,
     chunk_number: int = 0,
-    chunk_total: int = 1,
     model_workers: Optional[int] = None,
 ) -> None:
     """Транскрибирует один файл и дописывает результат в output_path."""
-    import time
-
     model = get_model(model_name, workers=model_workers)
     log.info(f"Начинаю транскрибацию: {input_path}")
 
@@ -315,26 +314,12 @@ def _transcribe_one_file(
     duration = info.duration
     log.info(f"Язык: {info.language} ({info.language_probability:.0%}), длительность: {format_timestamp(duration)}")
 
-    last_update = time.monotonic()
-    update_interval = 15
-
     with open(output_path, "a", encoding="utf-8") as f:
         for segment in segments:
-            start = chunk_offset + segment.start
-            end = chunk_offset + segment.end
             line = segment.text.strip()
             f.write(line + "\n")
             f.flush()
             log.debug(line)
-
-            now = time.monotonic()
-            if update_status and duration and (now - last_update) >= update_interval:
-                pct = min(int((chunk_number + 0.5) / chunk_total * 100), 99)
-                update_status(
-                    f"🎙 Транскрибирую часть {chunk_number}/{chunk_total}... {pct}%\n"
-                    f"[{format_timestamp(start)} / {format_timestamp(chunk_offset + duration)}]"
-                )
-                last_update = now
 
 
 def transcribe_file(
@@ -349,6 +334,7 @@ def transcribe_file(
     """
     file_duration = get_media_duration(input_path)
     ranges = build_chunk_ranges(file_duration, chunk_seconds=TRANSCRIPTION_CHUNK_SECONDS)
+    total_minutes = _format_minutes(file_duration)
 
     if len(ranges) > 1:
         log.info(f"Длительность файла {file_duration:.0f}s превышает лимит чанка, разбиваем на {len(ranges)} частей")
@@ -389,43 +375,58 @@ def transcribe_file(
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write("")
 
+            if update_status:
+                update_status(f"🎙 Готово частей: 0/{len(ranges)} · 0,0/{total_minutes} мин")
+
             workers = min(get_worker_count(model_name), len(ranges))
             get_model(model_name, workers=workers)
+            completed_parts = 0
+            completed_seconds = 0.0
             if workers == 1:
                 for i, (start, end) in enumerate(ranges, start=1):
-                    if update_status:
-                        update_status(f"🎙 Транскрибирую часть {i}/{len(ranges)}...")
                     _transcribe_one_file(
                         input_path=chunk_files[i - 1],
                         model_name=model_name,
                         output_path=output_path,
-                        update_status=update_status,
-                        chunk_offset=start,
                         chunk_number=i,
-                        chunk_total=len(ranges),
                         model_workers=workers,
                     )
                     clear_model()
+                    completed_parts += 1
+                    completed_seconds += end - start
+                    if update_status:
+                        update_status(
+                            f"🎙 Готово частей: {completed_parts}/{len(ranges)} · "
+                            f"{_format_minutes(completed_seconds)}/{total_minutes} мин"
+                        )
             else:
                 part_paths = [f"{output_path}.part{i:03d}" for i in range(1, len(ranges) + 1)]
                 with ThreadPoolExecutor(max_workers=workers) as executor:
-                    futures = [
+                    futures = {
                         executor.submit(
                             _transcribe_one_file,
                             input_path=chunk_files[i - 1],
                             model_name=model_name,
                             output_path=part_paths[i - 1],
-                            update_status=update_status,
-                            chunk_offset=start,
                             chunk_number=i,
-                            chunk_total=len(ranges),
                             model_workers=workers,
-                        )
-                        for i, (start, end) in enumerate(ranges, start=1)
-                    ]
+                        ): i
+                        for i in range(1, len(ranges) + 1)
+                    }
+                    for future in as_completed(futures):
+                        future.result()
+                        completed_parts += 1
+                        part_number = futures[future]
+                        start, end = ranges[part_number - 1]
+                        completed_seconds += end - start
+                        if update_status:
+                            update_status(
+                                f"🎙 Готово частей: {completed_parts}/{len(ranges)} · "
+                                f"{_format_minutes(completed_seconds)}/{total_minutes} мин"
+                            )
+
                     with open(output_path, "a", encoding="utf-8") as output_file:
-                        for future, part_path in zip(futures, part_paths):
-                            future.result()
+                        for part_path in part_paths:
                             with open(part_path, encoding="utf-8") as part_file:
                                 shutil.copyfileobj(part_file, output_file)
                             output_file.flush()
@@ -453,7 +454,10 @@ def transcribe_file(
         log.info(f"Язык: {info.language} ({info.language_probability:.0%}), длительность: {format_timestamp(duration)}")
 
         last_update = time.monotonic()
-        update_interval = 15  # секунд между обновлениями статуса
+        update_interval = 15
+
+        if update_status:
+            update_status(f"🎙 Часть 1/1 · 0,0/{_format_minutes(duration)} мин")
 
         with open(output_path, "w", encoding="utf-8") as f:
             for segment in segments:
@@ -464,12 +468,12 @@ def transcribe_file(
 
                 now = time.monotonic()
                 if update_status and duration and (now - last_update) >= update_interval:
-                    pct = min(int(segment.end / duration * 100), 99)
-                    update_status(
-                        f"🎙 Транскрибирую... {pct}%\n"
-                        f"[{format_timestamp(segment.end)} / {format_timestamp(duration)}]"
-                    )
+                    update_status(f"🎙 Часть 1/1 · {_format_minutes(segment.end)}/{_format_minutes(duration)} мин")
                     last_update = now
+
+        if update_status:
+            duration_minutes = _format_minutes(duration)
+            update_status(f"🎙 Готово частей: 1/1 · {duration_minutes}/{duration_minutes} мин")
 
         log.info(f"Транскрипт сохранён: {output_path}")
         return output_path

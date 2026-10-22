@@ -288,10 +288,36 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Время обработки: ~40–90 мин для 2-часовой записи.\n"
         "Результат придёт .txt файлом без таймкодов.\n\n"
         "Чтобы остановить текущую расшифровку и получить готовую часть, отправь /stop.\n\n"
+        "Проверить доступность обработчика: /ping.\n\n"
         "Что принимаю:\n"
         "• Ссылку https://my.mts-link.ru/...\n"
         "• Прикреплённый аудио или видео файл (до 20 MB)"
     )
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not check_access(update):
+        return
+    message = update.effective_message
+    if message is None:
+        return
+    if not PROCESSOR_URL:
+        await message.reply_text("⚠️ PROCESSOR_URL не задан в .env.")
+        return
+
+    started_at = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            response = await client.get(f"{PROCESSOR_URL}/health")
+            response.raise_for_status()
+            if response.json().get("status") != "ok":
+                raise ValueError("неожиданный ответ health endpoint")
+    except (httpx.HTTPError, ValueError, AttributeError) as error:
+        await message.reply_text(f"❌ Обработчик недоступен: {error}")
+        return
+
+    elapsed_ms = round((time.monotonic() - started_at) * 1000)
+    await message.reply_text(f"✅ Обработчик доступен ({elapsed_ms} мс).")
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -543,6 +569,7 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(
