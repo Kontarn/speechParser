@@ -11,17 +11,7 @@ Telegram-бот для расшифровки записей МТС Линк и 
 
 ## Обработчик на VPS
 
-На VPS с Debian/Ubuntu установи Python, Git и FFmpeg, затем клонируй репозиторий. В каталоге проекта создай виртуальное окружение и установи зависимости:
-
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip ffmpeg git
-python3 -m venv venv
-source venv/bin/activate
-python -m pip install -r requirements.txt
-```
-
-Создай конфигурацию обработчика и закрой доступ к ней для других пользователей системы:
+Установи Docker Engine с Compose plugin на VPS с Debian/Ubuntu и клонируй репозиторий. Создай конфигурацию worker:
 
 ```bash
 cp .env.server.example .env.server
@@ -30,18 +20,24 @@ openssl rand -hex 32
 nano .env.server
 ```
 
-Впиши созданный секрет в `PROCESSOR_API_KEY`. Для приватных записей добавь cookie `access` в `MTS_SESSION_ID`. Оставь `PROCESSOR_HOST=127.0.0.1`, чтобы API принимал соединения только с самого VPS; значение API-ключа потребуется также в локальном `.env`.
+Впиши сгенерированный секрет в `PROCESSOR_API_KEY`. Для приватных записей добавь cookie `access` в `MTS_SESSION_ID`. `PROCESSOR_HOST` в файле оставь `127.0.0.1`: Compose переопределяет его внутри контейнера, а порт на VPS публикует только на loopback.
 
-Запусти обработчик из активированного виртуального окружения:
+Если worker уже запущен напрямую из `venv`, сначала останови его, чтобы освободить порт `8080`.
+
+Сборка образа и запуск worker выполняются одной командой:
 
 ```bash
-set -a
-source .env.server
-set +a
-python worker_server.py
+docker compose up -d --build
 ```
 
-Проверь, что `ffmpeg` и `ffprobe` доступны через `PATH`: `command -v ffmpeg` и `command -v ffprobe`.
+Проверить запуск и смотреть логи можно так:
+
+```bash
+docker compose ps
+docker compose logs -f worker
+```
+
+Контейнер перезапускается автоматически. Модели Whisper сохраняются в `whisper_cache`, временные задания — в `processor_data`. Порт доступен на VPS только через `127.0.0.1:8080`, поэтому SSH-туннель и локальный reverse proxy работают без изменений.
 
 ### Подключение бота через SSH-туннель
 
@@ -95,7 +91,28 @@ nano .env
 python bot.py
 ```
 
-В `.env` задай `BOT_TOKEN`, `ALLOWED_USER_ID`, `PROCESSOR_URL` (адрес VPS с HTTPS) и тот же `PROCESSOR_API_KEY`, что указан на сервере. `WHISPER_MODEL` выбирает модель, которую будет использовать удалённый обработчик.
+В `.env` задай `BOT_TOKEN`, `ALLOWED_USER_ID`, `PROCESSOR_URL` (например, `http://127.0.0.1:18080` для SSH-туннеля или HTTPS-адрес) и тот же `PROCESSOR_API_KEY`, что указан на сервере. `WHISPER_MODEL` выбирает модель, которую будет использовать удалённый обработчик.
+
+### Запуск worker без Docker
+
+На VPS с Debian/Ubuntu установи Python, Git и FFmpeg, затем подготовь виртуальное окружение:
+
+```bash
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip ffmpeg git
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Создай `.env.server` как описано выше. Для прямого запуска оставь `PROCESSOR_HOST=127.0.0.1`, затем загрузи переменные и запусти обработчик:
+
+```bash
+set -a
+source .env.server
+set +a
+python worker_server.py
+```
 
 Для фоновой работы бота можно использовать `tmux`:
 
@@ -113,7 +130,7 @@ python bot.py
 |---|---|---|
 | `BOT_TOKEN` | локально | Токен Telegram-бота от [@BotFather](https://t.me/BotFather) |
 | `ALLOWED_USER_ID` | локально | Telegram user ID, которому разрешён доступ |
-| `PROCESSOR_URL` | локально | HTTPS-адрес API на VPS |
+| `PROCESSOR_URL` | локально | URL worker: локальный адрес SSH-туннеля или HTTPS-адрес |
 | `PROCESSOR_API_KEY` | локально и VPS | Общий секрет для авторизации запросов |
 | `WHISPER_MODEL` | локально | Модель Whisper, по умолчанию `medium` |
 | `WHISPER_WORKERS` | VPS | Параллельные части транскрипции (`auto` или верхний предел числом) |
