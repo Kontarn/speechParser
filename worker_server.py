@@ -353,14 +353,24 @@ class ProcessorHandler(BaseHTTPRequestHandler):
         if len(parts) != 2 or parts[0] != "jobs":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Неизвестный endpoint."})
             return
+        job_dir = None
         with JOBS_LOCK:
-            job = JOBS.get(parts[1])
+            job_id = parts[1]
+            job = JOBS.get(job_id)
             if job and job["status"] in {"queued", "running"}:
                 job["cancel_event"].set()
+                status = "cancellation_requested"
+            elif job:
+                JOBS.pop(job_id)
+                job_dir = JOBS_DIR / job_id
+                status = "deleted"
         if job is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Задание не найдено."})
+        elif job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            self._send_json(HTTPStatus.OK, {"status": status})
         else:
-            self._send_json(HTTPStatus.ACCEPTED, {"status": "cancellation_requested"})
+            self._send_json(HTTPStatus.ACCEPTED, {"status": status})
 
 
 def main() -> None:

@@ -67,7 +67,9 @@ class RemoteProcessingTests(unittest.TestCase):
         server, server_thread = self._start_server()
 
         url = f"https://my.mts-link.ru/1/2/record-new/{uuid.uuid4().int}"
+        local_job_id = uuid.uuid4().hex
         output_path = None
+        bot.JOB_STATUS[local_job_id] = {"remote_job_id": None}
 
         try:
             with (
@@ -78,12 +80,23 @@ class RemoteProcessingTests(unittest.TestCase):
                 patch.object(bot, "REMOTE_POLL_INTERVAL_SECONDS", 0.01),
             ):
                 output_path = bot.get_transcript_path("url", (url, "medium"))
-                result = bot._run_pipeline_with_timeout("url", (url, "medium"), lambda _: None)
+                result = bot._run_pipeline_with_timeout(
+                    "url", (url, "medium"), lambda _: None, local_job_id
+                )
                 self.assertEqual(Path(result).read_text(encoding="utf-8"), "Удалённая расшифровка\n")
+                remote_job_id = bot.JOB_STATUS[local_job_id]["remote_job_id"]
+                remote_job_dir = worker_server.JOBS_DIR / remote_job_id
+                self.assertTrue(remote_job_dir.is_dir())
+
+                bot._cleanup_remote_job(local_job_id)
+
+                self.assertFalse(remote_job_dir.exists())
+                self.assertNotIn(remote_job_id, worker_server.JOBS)
         finally:
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=2)
+            bot.JOB_STATUS.pop(local_job_id, None)
             if output_path and output_path.exists():
                 output_path.unlink()
 

@@ -126,6 +126,26 @@ def _run_pipeline_with_timeout(kind: str, args: tuple, update_status, job_id: st
         raise TimeoutError(f"Превышено время обработки ({TRANSCRIPTION_TIMEOUT_SECONDS // 3600} ч.)")
 
 
+def _cleanup_remote_job(job_id: str) -> None:
+    job = JOB_STATUS.get(job_id)
+    remote_job_id = job.get("remote_job_id") if job else None
+    if not remote_job_id:
+        return
+
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(5.0, connect=2.0),
+            headers={"Authorization": f"Bearer {PROCESSOR_API_KEY}"},
+        ) as client:
+            response = client.delete(f"{PROCESSOR_URL}/jobs/{remote_job_id}")
+            if response.status_code != 404:
+                response.raise_for_status()
+    except httpx.HTTPError:
+        log.warning("Не удалось очистить удалённое задание %s", remote_job_id, exc_info=True)
+    else:
+        job["remote_job_id"] = None
+
+
 def _send_processing_failure(bot, chat_id: int, status_message_id: int, text: str, main_loop) -> None:
     async def _send() -> None:
         try:
@@ -387,6 +407,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 job_id,
             )
             _send_result_sync(context.bot, update.effective_chat.id, status_msg.message_id, transcript_path, main_loop)
+            _cleanup_remote_job(job_id)
         except TranscriptionCancelled:
             _send_partial_result_sync(
                 context.bot,
@@ -504,6 +525,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 job_id,
             )
             _send_result_sync(context.bot, update.effective_chat.id, status_msg.message_id, transcript_path, main_loop)
+            _cleanup_remote_job(job_id)
         except TranscriptionCancelled:
             _send_partial_result_sync(
                 context.bot,
