@@ -65,6 +65,26 @@ class TranscriptionCancelled(Exception):
     """Пайплайн остановлен пользователем, частичный результат можно отправить."""
 
 
+def _is_worker_unavailable(error: Exception) -> bool:
+    if isinstance(error, (httpx.NetworkError, httpx.TimeoutException,
+                          httpx.RemoteProtocolError, httpx.ProxyError)):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        if error.response.status_code in {502, 503, 504}:
+            return True
+        # Jobs are kept in the worker's memory and disappear after a restart.
+        return (error.response.status_code == 404
+                and error.request.method in {"GET", "DELETE"}
+                and "/jobs/" in error.request.url.path)
+    return False
+
+
+def _log_worker_unavailable(error: Exception, job_id: str) -> None:
+    reason = (f"HTTP {error.response.status_code}" if isinstance(error, httpx.HTTPStatusError)
+              else type(error).__name__)
+    log.warning("Воркер недоступен; локальное задание %s завершено (%s)", job_id, reason)
+
+
 def _run_pipeline_with_timeout(kind: str, args: tuple, update_status, job_id: str | None = None) -> str:
     if not PROCESSOR_URL or not PROCESSOR_API_KEY:
         raise RuntimeError("Задай PROCESSOR_URL и PROCESSOR_API_KEY для удалённого обработчика")
@@ -140,8 +160,9 @@ def _cleanup_remote_job(job_id: str) -> None:
             response = client.delete(f"{PROCESSOR_URL}/jobs/{remote_job_id}")
             if response.status_code != 404:
                 response.raise_for_status()
-    except httpx.HTTPError:
-        log.warning("Не удалось очистить удалённое задание %s", remote_job_id, exc_info=True)
+    except httpx.HTTPError as error:
+        log.warning("Не удалось очистить удалённое задание %s (%s)",
+                    remote_job_id, type(error).__name__)
     else:
         job["remote_job_id"] = None
 
@@ -334,7 +355,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             if response.json().get("status") != "ok":
                 raise ValueError("неожиданный ответ health endpoint")
     except (httpx.HTTPError, ValueError, AttributeError) as error:
-        await message.reply_text(f"❌ Обработчик недоступен: {error}")
+        log.warning("Воркер недоступен при /ping (%s)", type(error).__name__)
         return
 
     elapsed_ms = round((time.monotonic() - started_at) * 1000)
@@ -418,8 +439,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 main_loop,
             )
         except Exception as e:
-            log.exception(f"Ошибка пайплайна для {text}")
-            _send_processing_failure(context.bot, update.effective_chat.id, status_msg.message_id, str(e), main_loop)
+            if _is_worker_unavailable(e):
+                _log_worker_unavailable(e, job_id)
+            else:
+                log.exception(f"Ошибка пайплайна для {text}")
+                _send_processing_failure(context.bot, update.effective_chat.id, status_msg.message_id, str(e), main_loop)
         finally:
             release_job_slot(job_id)
 
@@ -536,8 +560,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 main_loop,
             )
         except Exception as e:
-            log.exception(f"Ошибка при обработке файла {filename}")
-            _send_processing_failure(context.bot, update.effective_chat.id, status_msg.message_id, str(e), main_loop)
+            if _is_worker_unavailable(e):
+                _log_worker_unavailable(e, job_id)
+            else:
+                log.exception(f"Ошибка при обработке файла {filename}")
+                _send_processing_failure(context.bot, update.effective_chat.id, status_msg.message_id, str(e), main_loop)
         finally:
             try:
                 os.unlink(tmp_path)
