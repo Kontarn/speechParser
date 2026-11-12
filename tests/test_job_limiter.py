@@ -234,8 +234,8 @@ class JobLimiterTests(unittest.TestCase):
             self.assertEqual(max_workers_used, [11, 4])
             expected_output = "".join(f"part{part}\n" for part in range(1, 12))
             self.assertEqual(output_path.read_text(encoding="utf-8"), expected_output)
-            self.assertEqual(status_updates[0], "🎙 Готово частей: 0/11 · 0,0/20,0 мин")
-            self.assertEqual(status_updates[-1], "🎙 Готово частей: 11/11 · 20,0/20,0 мин")
+            self.assertEqual(status_updates[0], "🎙 Готово частей: 0/11 · 0,0/20,0 мин записи")
+            self.assertEqual(status_updates[-1], "🎙 Готово частей: 11/11 · 20,0/20,0 мин записи")
 
     def test_build_chunk_ranges(self):
         ranges = pipeline.build_chunk_ranges(3700, chunk_seconds=600)

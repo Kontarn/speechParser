@@ -9,8 +9,10 @@
 """
 
 import logging
+import math
 import os
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -74,24 +76,67 @@ def _download_chunk(url: str, path: str, session_id: Optional[str]) -> None:
                     f.write(chunk)
 
 
-def _ffmpeg_concat(chunk_paths: list[str], output_path: str) -> None:
-    """Склеивает файлы через ffmpeg concat demuxer без перекодирования."""
-    list_path = output_path + ".filelist.txt"
-    with open(list_path, "w") as f:
-        for p in chunk_paths:
-            escaped = p.replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
-    try:
+def _ffmpeg_mix_timeline(
+    tracks: list[tuple[str, float]], output_path: str, duration: float | None,
+) -> None:
+    """Mix tracks at their real offsets without keeping the recording in RAM."""
+    import numpy as np
+
+    sample_rate = 16000
+    sample_bytes = 4  # float32 accumulator prevents clipping while summing tracks.
+    block_bytes = 256 * 1024
+    total_bytes = round(duration * sample_rate) * sample_bytes if duration is not None else 0
+    included = 0
+    with tempfile.TemporaryDirectory(prefix="audio_mix_", dir=Path(output_path).parent) as directory:
+        mixed_path = Path(directory) / "mixed.f32"
+        decoded_path = Path(directory) / "decoded.f32"
+        # A sparse disk file preserves gaps with zeroes. Each read/write is bounded;
+        # hundreds of late-starting tracks must not allocate huge adelay buffers.
+        with mixed_path.open("w+b") as mixed:
+            mixed.truncate(total_bytes)
+            for path, start in tracks:
+                if not math.isfinite(start):
+                    raise ValueError("Некорректное время начала аудиофрагмента")
+                if duration is not None and start >= duration:
+                    continue
+                filters = []
+                if start < 0:
+                    filters.append(f"atrim=start={-start:.9f}")
+                # relativeTime supplies the offset, regardless of container PTS.
+                filters.append("asetpts=N/SR/TB")
+                args = ["-threads", "1", "-i", path, "-map", "0:a:0", "-vn",
+                        "-af", ",".join(filters), "-ar", str(sample_rate), "-ac", "1"]
+                if duration is not None:
+                    args.extend(["-t", f"{duration - max(0, start):.9f}"])
+                _ffmpeg_run(args + ["-c:a", "pcm_f32le", "-f", "f32le", str(decoded_path)])
+                offset = round(max(0, start) * sample_rate) * sample_bytes
+                decoded_bytes = decoded_path.stat().st_size
+                if duration is None:
+                    total_bytes = max(total_bytes, offset + decoded_bytes)
+                    mixed.truncate(total_bytes)
+                remaining = min(decoded_bytes, max(0, total_bytes - offset))
+                if not remaining:
+                    continue
+                included += 1
+                with decoded_path.open("rb") as decoded:
+                    while remaining:
+                        data = decoded.read(min(block_bytes, remaining))
+                        if not data:
+                            raise RuntimeError("Не удалось прочитать декодированный аудиофрагмент")
+                        mixed.seek(offset)
+                        values = np.frombuffer(mixed.read(len(data)), dtype="<f4").copy()
+                        values += np.frombuffer(data, dtype="<f4")
+                        mixed.seek(offset)
+                        mixed.write(values.tobytes())
+                        offset += len(data)
+                        remaining -= len(data)
+        if not included:
+            raise RuntimeError("Нет аудиофрагментов в пределах записи")
         _ffmpeg_run([
-            "-fflags", "+genpts",   # пересчитываем PTS чтобы избежать out-of-order
-            "-f", "concat",
-            "-safe", "0",
-            "-i", list_path,
-            "-c", "copy",
-            output_path,
+            "-f", "f32le", "-ar", str(sample_rate), "-ac", "1", "-i", str(mixed_path),
+            "-af", "alimiter=limit=0.95:level=0:latency=1",
+            "-c:a", "pcm_s16le", "-rf64", "auto", output_path,
         ])
-    finally:
-        os.unlink(list_path)
 
 
 def _has_audio_stream(video_path: str) -> bool:
@@ -104,14 +149,9 @@ def _has_audio_stream(video_path: str) -> bool:
     return bool(result.stdout.strip())
 
 
-def _ffmpeg_extract_audio(video_path: str, output_path: str) -> None:
-    """Извлекает аудио дорожку из видео файла без перекодирования."""
-    _ffmpeg_run(["-i", video_path, "-vn", "-c:a", "copy", output_path])
-
-
 def _ffmpeg_run(args: list[str]) -> None:
     result = subprocess.run(
-        ["ffmpeg", "-y"] + args,
+        ["ffmpeg", "-nostdin", "-y"] + args,
         capture_output=True,
         text=True,
     )
@@ -139,16 +179,30 @@ def download_audio_only(
     if not event_logs:
         raise RuntimeError("eventLogs пустой — не удалось получить список чанков")
 
-    # Собираем все URL чанков с временными метками
+    try:
+        duration = float(json_data.get("duration", 0))
+    except (TypeError, ValueError):
+        duration = 0.0
+    duration = duration if math.isfinite(duration) and duration > 0 else None
+
+    # An event can be repeated; identical URLs at different times are retained.
     chunks = []
+    seen = set()
     for event in event_logs:
         if not isinstance(event, dict):
             continue
         data = event.get("data", {})
         if isinstance(data, dict) and "url" in data:
+            start = float(event.get("relativeTime", 0))
+            if not math.isfinite(start):
+                raise ValueError("Некорректный relativeTime в метаданных МТС Линк")
+            key = (data["url"], start)
+            if key in seen:
+                continue
+            seen.add(key)
             chunks.append({
                 "url": data["url"],
-                "start": event.get("relativeTime", 0),
+                "start": start,
             })
 
     if not chunks:
@@ -160,8 +214,8 @@ def download_audio_only(
     content_types: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_url = {
-            executor.submit(_get_content_type, c["url"], session_id): c["url"]
-            for c in chunks
+            executor.submit(_get_content_type, url, session_id): url
+            for url in dict.fromkeys(c["url"] for c in chunks)
         }
         for future in as_completed(future_to_url):
             url = future_to_url[future]
@@ -181,67 +235,35 @@ def download_audio_only(
 
     chunks_dir = os.path.join(work_dir, "chunks")
     os.makedirs(chunks_dir, exist_ok=True)
-    output_path = os.path.join(work_dir, f"audio_{event_session_id}.m4a")
+    output_path = os.path.join(work_dir, f"audio_{event_session_id}.wav")
 
-    # --- Стратегия 1: есть отдельные аудио чанки ---
     if audio_chunks:
         log.info(f"Стратегия: аудио чанки ({len(audio_chunks)} шт., пропускаем {len(video_chunks)} видео)")
-        chunk_paths = []
-        for i, chunk in enumerate(audio_chunks, start=1):
+        selected = audio_chunks
+    elif video_chunks:
+        log.info("Стратегия: аудиодорожки из %s видеофрагментов", len(video_chunks))
+        selected = video_chunks
+    else:
+        raise RuntimeError("Не найдено ни аудио ни видео чанков в записи")
+
+    tracks = []
+    downloaded = {}
+    for i, chunk in enumerate(selected, start=1):
+        url = chunk["url"]
+        if url not in downloaded:
             filename = f"{i:04d}_{Path(chunk['url'].split('?')[0]).name}"
             file_path = os.path.join(chunks_dir, filename)
-            log.info(f"[{i}/{len(audio_chunks)}] Скачиваю аудио чанк...")
-            _download_chunk(chunk["url"], file_path, session_id)
-            chunk_paths.append(file_path)
+            log.info("[%s/%s] Скачиваю медиафрагмент...", i, len(selected))
+            _download_chunk(url, file_path, session_id)
+            downloaded[url] = file_path
+        file_path = downloaded[url]
+        if not audio_chunks and not _has_audio_stream(file_path):
+            log.info("Фрагмент без аудио — пропускаю: %s", file_path)
+            continue
+        tracks.append((file_path, chunk["start"]))
 
-        if len(chunk_paths) == 1:
-            # Один файл — просто копируем
-            import shutil
-            shutil.copy2(chunk_paths[0], output_path)
-        else:
-            _ffmpeg_concat(chunk_paths, output_path)
-
-        log.info(f"Готово (аудио чанки): {output_path}")
-        return output_path
-
-    # --- Стратегия 2: только видео чанки — из каждого извлекаем аудио, потом склеиваем ---
-    if video_chunks:
-        log.info(f"Стратегия: извлечение аудио из видео ({len(video_chunks)} чанков)")
-        chunk_paths = []
-        for i, chunk in enumerate(video_chunks, start=1):
-            filename = f"{i:04d}_{Path(chunk['url'].split('?')[0]).name}"
-            file_path = os.path.join(chunks_dir, filename)
-            log.info(f"[{i}/{len(video_chunks)}] Скачиваю видео чанк...")
-            _download_chunk(chunk["url"], file_path, session_id)
-            chunk_paths.append(file_path)
-
-        if len(chunk_paths) == 1:
-            # Один чанк — сразу извлекаем аудио
-            if not _has_audio_stream(chunk_paths[0]):
-                raise RuntimeError("Единственный видео чанк не содержит аудио дорожки")
-            _ffmpeg_extract_audio(chunk_paths[0], output_path)
-        else:
-            # Несколько чанков — сначала извлекаем аудио из каждого отдельно,
-            # потом склеиваем аудио. Прямая склейка видео чанков не работает
-            # из-за несовместимых DTS таймстемпов между сегментами.
-            audio_dir = os.path.join(work_dir, "audio_parts")
-            os.makedirs(audio_dir, exist_ok=True)
-            audio_parts = []
-            for i, vpath in enumerate(chunk_paths, start=1):
-                if not _has_audio_stream(vpath):
-                    log.info(f"[{i}/{len(chunk_paths)}] Чанк без аудио — пропускаю")
-                    continue
-                apath = os.path.join(audio_dir, f"{i:04d}.m4a")
-                log.info(f"[{i}/{len(chunk_paths)}] Извлекаю аудио из чанка...")
-                _ffmpeg_extract_audio(vpath, apath)
-                audio_parts.append(apath)
-
-            if not audio_parts:
-                raise RuntimeError("Ни в одном видео чанке не найдена аудио дорожка")
-
-            _ffmpeg_concat(audio_parts, output_path)
-
-        log.info(f"Готово (извлечение из видео): {output_path}")
-        return output_path
-
-    raise RuntimeError("Не найдено ни аудио ни видео чанков в записи")
+    log.info("Собираю %s аудиофрагментов по relativeTime; длительность записи: %s с",
+             len(tracks), duration)
+    _ffmpeg_mix_timeline(tracks, output_path, duration)
+    log.info("Аудио по временной шкале записи готово: %s", output_path)
+    return output_path

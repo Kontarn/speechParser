@@ -7,7 +7,9 @@
 
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -239,9 +241,10 @@ def get_model(model_name: str, workers: Optional[int] = None,
 
 
 def get_media_duration(input_path: str) -> float:
-    """Возвращает длительность медиафайла в секундах через ffprobe."""
+    """Prefer the duration of the same audio stream that Whisper decodes."""
     result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=duration:format=duration", "-of", "json", input_path],
         capture_output=True,
         text=True,
         check=False,
@@ -249,9 +252,20 @@ def get_media_duration(input_path: str) -> float:
     if result.returncode != 0 or not result.stdout.strip():
         return 0.0
     try:
-        return float(result.stdout.strip())
-    except ValueError:
+        metadata = json.loads(result.stdout)
+    except (ValueError, TypeError):
         return 0.0
+    streams = metadata.get("streams", [])
+    candidates = [streams[0].get("duration")] if streams else []
+    candidates.append(metadata.get("format", {}).get("duration"))
+    for value in candidates:
+        try:
+            duration = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    return 0.0
 
 
 def parse_mts_url(url: str) -> tuple[str, Optional[str]]:
@@ -375,6 +389,7 @@ def transcribe_file(
                         "-threads", "1",
                         "-i", input_path,
                         "-t", str(end - start),
+                        "-map", "0:a:0",
                         "-vn",
                         "-acodec", "pcm_s16le",
                         "-ar", "16000",
@@ -413,7 +428,7 @@ def transcribe_file(
             workers = config.workers
             get_model(model_name, workers=workers, cpu_threads=config.threads)
             if update_status:
-                update_status(f"🎙 Готово частей: 0/{len(ranges)} · 0,0/{total_minutes} мин")
+                update_status(f"🎙 Готово частей: 0/{len(ranges)} · 0,0/{total_minutes} мин записи")
             completed_parts = 0
             completed_seconds = 0.0
             if workers == 1:
@@ -431,7 +446,7 @@ def transcribe_file(
                     if update_status:
                         update_status(
                             f"🎙 Готово частей: {completed_parts}/{len(ranges)} · "
-                            f"{_format_minutes(completed_seconds)}/{total_minutes} мин"
+                            f"{_format_minutes(completed_seconds)}/{total_minutes} мин записи"
                         )
             else:
                 part_paths = [f"{output_path}.part{i:03d}" for i in range(1, len(ranges) + 1)]
@@ -457,7 +472,7 @@ def transcribe_file(
                         if update_status:
                             update_status(
                                 f"🎙 Готово частей: {completed_parts}/{len(ranges)} · "
-                                f"{_format_minutes(completed_seconds)}/{total_minutes} мин"
+                                f"{_format_minutes(completed_seconds)}/{total_minutes} мин записи"
                             )
 
                     with open(output_path, "a", encoding="utf-8") as output_file:
@@ -489,7 +504,7 @@ def transcribe_file(
         update_interval = 15
 
         if update_status:
-            update_status(f"🎙 Часть 1/1 · 0,0/{_format_minutes(duration)} мин")
+            update_status(f"🎙 Часть 1/1 · 0,0/{_format_minutes(duration)} мин записи")
 
         with open(output_path, "w", encoding="utf-8") as f:
             for segment in segments:
@@ -500,12 +515,12 @@ def transcribe_file(
 
                 now = time.monotonic()
                 if update_status and duration and (now - last_update) >= update_interval:
-                    update_status(f"🎙 Часть 1/1 · {_format_minutes(segment.end)}/{_format_minutes(duration)} мин")
+                    update_status(f"🎙 Часть 1/1 · {_format_minutes(segment.end)}/{_format_minutes(duration)} мин записи")
                     last_update = now
 
         if update_status:
             duration_minutes = _format_minutes(duration)
-            update_status(f"🎙 Готово частей: 1/1 · {duration_minutes}/{duration_minutes} мин")
+            update_status(f"🎙 Готово частей: 1/1 · {duration_minutes}/{duration_minutes} мин записи")
 
         log.info(f"Транскрипт сохранён: {output_path}")
         return output_path
