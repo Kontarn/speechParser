@@ -14,24 +14,24 @@ import os
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional
 
 import httpx
 
 log = logging.getLogger(__name__)
 
-TIMEOUT = httpx.Timeout(None, connect=30.0)
+TIMEOUT = httpx.Timeout(60, connect=15)
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
 }
 
 
-def _make_cookies(session_id: Optional[str]) -> dict:
+def _make_cookies(session_id: str | None) -> dict:
     return {"access": session_id} if session_id else {}
 
 
-def _fetch_event_json(event_session_id: str, record_id: Optional[str], session_id: Optional[str]) -> dict:
+def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: str | None, *, client=None) -> dict:
     """Получает JSON с метаданными записи через API МТС Линк."""
     if record_id:
         url = (
@@ -45,35 +45,44 @@ def _fetch_event_json(event_session_id: str, record_id: Optional[str], session_i
         )
 
     log.info(f"Запрос метаданных: {url}")
-    with httpx.Client(timeout=TIMEOUT) as client:
-        response = client.get(url, headers=HEADERS, cookies=_make_cookies(session_id))
+    with nullcontext(client) if client is not None else httpx.Client(timeout=TIMEOUT) as http:
+        response = http.get(url, headers=HEADERS, cookies=_make_cookies(session_id))
 
     if response.status_code == 403:
         raise PermissionError("Доступ запрещён (403). Укажи session_id для приватной записи.")
 
     response.raise_for_status()
-    return response.json()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise TypeError("API МТС Линк вернул некорректные метаданные")
+    return payload
 
 
-def _get_content_type(url: str, session_id: Optional[str]) -> str:
-    """Определяет Content-Type чанка через HEAD запрос."""
+def _get_content_type(url: str, session_id: str | None, *, client=None) -> str:
+    """Use a streamed GET when the media server does not support useful HEADs."""
     try:
-        with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            r = client.head(url, headers=HEADERS, cookies=_make_cookies(session_id), follow_redirects=True)
-        return r.headers.get("content-type", "")
-    except Exception as e:
-        log.warning(f"HEAD запрос не удался для {url}: {e}")
+        with nullcontext(client) if client is not None else httpx.Client(timeout=TIMEOUT) as http:
+            response = http.head(url, headers=HEADERS, cookies=_make_cookies(session_id), follow_redirects=True)
+            content_type = response.headers.get("content-type", "").lower()
+            if response.status_code in {405, 501} or not content_type or content_type.startswith("application/octet-stream"):
+                with http.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
+                                 follow_redirects=True) as media:
+                    media.raise_for_status()
+                    return media.headers.get("content-type", "").lower()
+            response.raise_for_status()
+            return content_type
+    except httpx.HTTPError as error:
+        log.warning("Не удалось определить тип медиафрагмента (%s)", type(error).__name__)
         return ""
 
 
-def _download_chunk(url: str, path: str, session_id: Optional[str]) -> None:
-    """Скачивает один чанк в файл."""
-    with httpx.Client(timeout=TIMEOUT) as client:
-        with client.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id)) as response:
-            response.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in response.iter_bytes(chunk_size=65536):
-                    f.write(chunk)
+def _download_chunk(url: str, path: str, session_id: str | None, *, client=None) -> None:
+    context = nullcontext(client) if client is not None else httpx.Client(timeout=TIMEOUT)
+    with context as http, http.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
+                                      follow_redirects=True) as response:
+        response.raise_for_status()
+        with open(path, "wb") as output:
+            output.writelines(response.iter_bytes(chunk_size=65536))
 
 
 def _ffmpeg_mix_timeline(
@@ -144,7 +153,7 @@ def _has_audio_stream(video_path: str) -> bool:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a",
          "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path],
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,
     )
     return bool(result.stdout.strip())
 
@@ -154,6 +163,7 @@ def _ffmpeg_run(args: list[str]) -> None:
         ["ffmpeg", "-nostdin", "-y"] + args,
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         log.error(f"ffmpeg stderr: {result.stderr[-2000:]}")
@@ -163,17 +173,18 @@ def _ffmpeg_run(args: list[str]) -> None:
         log.debug(f"ffmpeg warnings: {result.stderr[-500:]}")
 
 
-def download_audio_only(
+def _download_audio_only(
     event_session_id: str,
-    record_id: Optional[str],
-    session_id: Optional[str],
+    record_id: str | None,
+    session_id: str | None,
     work_dir: str,
+    client,
 ) -> str:
     """
     Скачивает аудио из записи МТС Линк максимально быстро.
     Возвращает путь к итоговому аудио файлу.
     """
-    json_data = _fetch_event_json(event_session_id, record_id, session_id)
+    json_data = _fetch_event_json(event_session_id, record_id, session_id, client=client)
 
     event_logs = json_data.get("eventLogs", [])
     if not event_logs:
@@ -214,7 +225,7 @@ def download_audio_only(
     content_types: dict[str, str] = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_url = {
-            executor.submit(_get_content_type, url, session_id): url
+            executor.submit(_get_content_type, url, session_id, client=client): url
             for url in dict.fromkeys(c["url"] for c in chunks)
         }
         for future in as_completed(future_to_url):
@@ -222,7 +233,7 @@ def download_audio_only(
             content_types[url] = future.result()
 
     for c in chunks:
-        log.info(f"  {content_types[c['url']]:20s}  {c['url']}")
+        log.debug("Медиафрагмент: %s, начало %.3f с", content_types[c["url"]], c["start"])
 
     audio_chunks = sorted(
         [c for c in chunks if content_types[c["url"]].startswith("audio/")],
@@ -251,11 +262,16 @@ def download_audio_only(
     for i, chunk in enumerate(selected, start=1):
         url = chunk["url"]
         if url not in downloaded:
-            filename = f"{i:04d}_{Path(chunk['url'].split('?')[0]).name}"
-            file_path = os.path.join(chunks_dir, filename)
-            log.info("[%s/%s] Скачиваю медиафрагмент...", i, len(selected))
-            _download_chunk(url, file_path, session_id)
-            downloaded[url] = file_path
+            filename = f"{i:04d}_{Path(url.split('?')[0]).name}"
+            downloaded[url] = os.path.join(chunks_dir, filename)
+    with ThreadPoolExecutor(max_workers=min(4, len(downloaded))) as executor:
+        futures = [executor.submit(_download_chunk, url, path, session_id, client=client)
+                   for url, path in downloaded.items()]
+        for number, future in enumerate(as_completed(futures), 1):
+            future.result()
+            log.info("Скачано медиафрагментов: %s/%s", number, len(futures))
+    for chunk in selected:
+        url = chunk["url"]
         file_path = downloaded[url]
         if not audio_chunks and not _has_audio_stream(file_path):
             log.info("Фрагмент без аудио — пропускаю: %s", file_path)
@@ -267,3 +283,11 @@ def download_audio_only(
     _ffmpeg_mix_timeline(tracks, output_path, duration)
     log.info("Аудио по временной шкале записи готово: %s", output_path)
     return output_path
+
+
+def download_audio_only(event_session_id: str, record_id: str | None,
+                        session_id: str | None, work_dir: str) -> str:
+    # One reusable, thread-safe connection pool for metadata, HEADs and downloads.
+    with httpx.Client(timeout=TIMEOUT, limits=httpx.Limits(max_connections=10,
+                                                        max_keepalive_connections=10)) as client:
+        return _download_audio_only(event_session_id, record_id, session_id, work_dir, client)

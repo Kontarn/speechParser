@@ -13,15 +13,29 @@ import os
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from telegram import BotCommand, MenuButtonCommands, Update
-from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import BadRequest, TelegramError
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-from pipeline import BASE_DIR, parse_mts_url
+from common import (
+    BASE_DIR,
+    MTS_LINK_PREFIX,
+    SUPPORTED_EXTENSIONS,
+    TranscriptionCancelled,
+    parse_mts_url,
+)
+from processor_client import ProcessorClient
 
 load_dotenv()
 
@@ -52,17 +66,13 @@ PROCESSOR_API_KEY = os.getenv("PROCESSOR_API_KEY", "")
 TRANSCRIPTION_TIMEOUT_SECONDS = _env_int("TRANSCRIPTION_TIMEOUT_SECONDS", 3 * 60 * 60)
 REMOTE_POLL_INTERVAL_SECONDS = 2
 
-MTS_LINK_PREFIX = "https://my.mts-link.ru/"
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB — лимит скачивания через облачный Telegram Bot API
-SUPPORTED_EXTENSIONS = {".mp4", ".mp3", ".wav", ".m4a", ".ogg", ".webm", ".mkv", ".avi", ".mov"}
 MAX_CONCURRENT_JOBS = 1
+MAX_PENDING_JOBS = max(1, _env_int("BOT_MAX_PENDING_JOBS", 32))
 ACTIVE_JOBS = 0
 JOB_QUEUE = []
 JOB_STATUS = {}
-
-
-class TranscriptionCancelled(Exception):
-    """Пайплайн остановлен пользователем, частичный результат можно отправить."""
+JOB_CONDITION = threading.Condition()
 
 
 def _is_worker_unavailable(error: Exception) -> bool:
@@ -85,198 +95,177 @@ def _log_worker_unavailable(error: Exception, job_id: str) -> None:
     log.warning("Воркер недоступен; локальное задание %s завершено (%s)", job_id, reason)
 
 
+def _processor_client() -> ProcessorClient:
+    return ProcessorClient(PROCESSOR_URL, PROCESSOR_API_KEY,
+                           TRANSCRIPTION_TIMEOUT_SECONDS, REMOTE_POLL_INTERVAL_SECONDS)
+
+
 def _run_pipeline_with_timeout(kind: str, args: tuple, update_status, job_id: str | None = None) -> str:
-    if not PROCESSOR_URL or not PROCESSOR_API_KEY:
-        raise RuntimeError("Задай PROCESSOR_URL и PROCESSOR_API_KEY для удалённого обработчика")
+    with JOB_CONDITION:
+        job = JOB_STATUS.get(job_id, {})
+        output_path = Path(job.get("output_path") or get_transcript_path(kind, args))
 
-    headers = {"Authorization": f"Bearer {PROCESSOR_API_KEY}"}
-    timeout = httpx.Timeout(TRANSCRIPTION_TIMEOUT_SECONDS, connect=30.0)
-    output_path = get_transcript_path("url" if kind == "url" else "file", args)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    def cancelled():
+        with JOB_CONDITION:
+            return bool(JOB_STATUS.get(job_id, {}).get("cancel_requested"))
 
-    with httpx.Client(timeout=timeout, headers=headers) as client:
-        if kind == "url":
-            response = client.post(
-                f"{PROCESSOR_URL}/jobs",
-                json={"url": args[0], "model": args[1]},
-            )
-        else:
-            input_path, model_name = args
-            with open(input_path, "rb") as input_file:
-                response = client.post(
-                    f"{PROCESSOR_URL}/jobs/file",
-                    params={"filename": Path(input_path).name, "model": model_name},
-                    content=input_file,
-                    headers={"Content-Type": "application/octet-stream"},
-                )
-        response.raise_for_status()
-        remote_job_id = response.json()["job_id"]
-        if job_id and job_id in JOB_STATUS:
-            JOB_STATUS[job_id]["remote_job_id"] = remote_job_id
+    def submitted(remote_id):
+        with JOB_CONDITION:
+            if job_id in JOB_STATUS:
+                JOB_STATUS[job_id]["remote_job_id"] = remote_id
 
-        deadline = time.monotonic() + TRANSCRIPTION_TIMEOUT_SECONDS
-        cancel_sent = False
-        last_status = None
-        while time.monotonic() < deadline:
-            if job_id and JOB_STATUS.get(job_id, {}).get("cancel_requested") and not cancel_sent:
-                client.delete(f"{PROCESSOR_URL}/jobs/{remote_job_id}").raise_for_status()
-                cancel_sent = True
-
-            response = client.get(f"{PROCESSOR_URL}/jobs/{remote_job_id}")
-            response.raise_for_status()
-            status = response.json()
-            if status.get("message") and status["message"] != last_status:
-                update_status(status["message"])
-                last_status = status["message"]
-
-            if status["status"] in {"completed", "cancelled"}:
-                result_response = client.get(f"{PROCESSOR_URL}/jobs/{remote_job_id}/result")
-                if result_response.status_code == 200:
-                    output_path.write_bytes(result_response.content)
-                elif status["status"] == "completed":
-                    result_response.raise_for_status()
-                if status["status"] == "cancelled":
-                    raise TranscriptionCancelled
-                return str(output_path)
-            if status["status"] == "failed":
-                raise RuntimeError(status.get("error") or "Удалённый обработчик завершился с ошибкой")
-            time.sleep(REMOTE_POLL_INTERVAL_SECONDS)
-
-        client.delete(f"{PROCESSOR_URL}/jobs/{remote_job_id}")
-        raise TimeoutError(f"Превышено время обработки ({TRANSCRIPTION_TIMEOUT_SECONDS // 3600} ч.)")
+    return _processor_client().run(kind, args, output_path, update_status, cancelled, submitted)
 
 
 def _cleanup_remote_job(job_id: str) -> None:
-    job = JOB_STATUS.get(job_id)
-    remote_job_id = job.get("remote_job_id") if job else None
-    if not remote_job_id:
-        return
-
-    try:
-        with httpx.Client(
-            timeout=httpx.Timeout(5.0, connect=2.0),
-            headers={"Authorization": f"Bearer {PROCESSOR_API_KEY}"},
-        ) as client:
-            response = client.delete(f"{PROCESSOR_URL}/jobs/{remote_job_id}")
-            if response.status_code != 404:
-                response.raise_for_status()
-    except httpx.HTTPError as error:
-        log.warning("Не удалось очистить удалённое задание %s (%s)",
-                    remote_job_id, type(error).__name__)
-    else:
-        job["remote_job_id"] = None
+    with JOB_CONDITION:
+        job = JOB_STATUS.get(job_id)
+        remote_id = job.get("remote_job_id") if job else None
+    if remote_id and _processor_client().cleanup(remote_id):
+        with JOB_CONDITION:
+            if job_id in JOB_STATUS:
+                JOB_STATUS[job_id]["remote_job_id"] = None
 
 
 def _send_processing_failure(bot, chat_id: int, status_message_id: int, text: str, main_loop) -> None:
     async def _send() -> None:
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=status_message_id, text="❌ Обработка остановлена.")
-        except Exception:
-            pass
+        await _edit_status(bot, chat_id, status_message_id, "❌ Обработка остановлена.")
         await bot.send_message(chat_id=chat_id, text=f"❌ Не удалось обработать запись: {text}")
 
-    asyncio.run_coroutine_threadsafe(_send(), main_loop)
+    future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
+    future.result(timeout=30)
+
+
+def _refresh_queue_positions() -> None:
+    for position, job_id in enumerate(JOB_QUEUE, 1):
+        JOB_STATUS[job_id]["position"] = position
 
 
 def register_job(job_type: str, user_id: int, chat_id: int, message_id: int) -> str:
-    import uuid
-
-    job_id = uuid.uuid4().hex
-    JOB_STATUS[job_id] = {
-        "job_type": job_type,
-        "user_id": user_id,
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "status": "queued",
-        "position": 0,
-        "created_at": __import__("time").time(),
-        "process": None,
-        "cancel_requested": False,
-    }
-    JOB_QUEUE.append(job_id)
-    JOB_STATUS[job_id]["position"] = JOB_QUEUE.index(job_id) + 1
-    return job_id
+    with JOB_CONDITION:
+        now = time.time()
+        for old_id, job in list(JOB_STATUS.items()):
+            if job["status"] not in {"queued", "running"} and now - job.get("finished_at", now) > 86400:
+                if job.get("output_path"):
+                    try:
+                        Path(job["output_path"]).unlink(missing_ok=True)
+                    except OSError:
+                        log.warning("Не удалось удалить старый результат %s", old_id)
+                JOB_STATUS.pop(old_id)
+        if sum(job["status"] in {"queued", "running", "delivering"} for job in JOB_STATUS.values()) >= MAX_PENDING_JOBS:
+            raise OverflowError("Очередь заполнена. Повтори запрос позже.")
+        job_id = uuid.uuid4().hex
+        JOB_STATUS[job_id] = {
+            "job_type": job_type, "user_id": user_id, "chat_id": chat_id,
+            "message_id": message_id, "status": "queued", "position": 0,
+            "created_at": now, "cancel_requested": False, "slot_acquired": False,
+        }
+        JOB_QUEUE.append(job_id)
+        _refresh_queue_positions()
+        return job_id
 
 
 def get_queue_position(job_id: str) -> int:
-    if job_id not in JOB_STATUS:
-        return 0
-    return JOB_STATUS[job_id].get("position", 0)
+    with JOB_CONDITION:
+        return JOB_STATUS.get(job_id, {}).get("position", 0)
 
 
 def acquire_job_slot(job_id: str | None = None) -> bool:
     global ACTIVE_JOBS
-    if job_id is not None and job_id in JOB_QUEUE:
-        JOB_QUEUE.remove(job_id)
-    if ACTIVE_JOBS >= MAX_CONCURRENT_JOBS:
-        if job_id and job_id in JOB_STATUS:
-            JOB_STATUS[job_id]["status"] = "queued"
-            JOB_STATUS[job_id]["position"] = JOB_QUEUE.index(job_id) + 1 if job_id in JOB_QUEUE else 1
-        return False
-    ACTIVE_JOBS += 1
-    if job_id and job_id in JOB_STATUS:
-        JOB_STATUS[job_id]["status"] = "running"
-        JOB_STATUS[job_id]["position"] = 0
-    return True
+    with JOB_CONDITION:
+        job = JOB_STATUS.get(job_id)
+        if job and job.get("slot_acquired"):
+            return True
+        if job and (job.get("cancel_requested") or job["status"] == "cancelled"):
+            return False
+        if ACTIVE_JOBS >= MAX_CONCURRENT_JOBS or (JOB_QUEUE and JOB_QUEUE[0] != job_id):
+            return False
+        if job_id in JOB_QUEUE:
+            JOB_QUEUE.remove(job_id)
+        ACTIVE_JOBS += 1
+        if job:
+            job.update(status="running", position=0, slot_acquired=True)
+        _refresh_queue_positions()
+        return True
 
 
-def release_job_slot(job_id: str | None = None) -> None:
+def wait_for_job_slot(job_id: str) -> bool:
+    with JOB_CONDITION:
+        while True:
+            job = JOB_STATUS.get(job_id)
+            if not job or job.get("cancel_requested") or job["status"] == "cancelled":
+                return False
+            if acquire_job_slot(job_id):
+                return True
+            JOB_CONDITION.wait(timeout=0.5)
+
+
+def release_job_slot(job_id: str | None = None, status: str = "done") -> None:
     global ACTIVE_JOBS
-    ACTIVE_JOBS = max(0, ACTIVE_JOBS - 1)
-    if job_id and job_id in JOB_STATUS:
-        JOB_STATUS[job_id]["status"] = "done"
-        JOB_STATUS[job_id]["position"] = 0
-
-    for queued_id in JOB_QUEUE:
-        if queued_id in JOB_STATUS:
-            JOB_STATUS[queued_id]["status"] = "queued"
-            JOB_STATUS[queued_id]["position"] = JOB_QUEUE.index(queued_id) + 1
+    with JOB_CONDITION:
+        job = JOB_STATUS.get(job_id)
+        if job_id is None or (job and job.get("slot_acquired")):
+            ACTIVE_JOBS = max(0, ACTIVE_JOBS - 1)
+        if job:
+            job.update(status=status, position=0, slot_acquired=False, finished_at=time.time())
+        if job_id in JOB_QUEUE:
+            JOB_QUEUE.remove(job_id)
+        _refresh_queue_positions()
+        JOB_CONDITION.notify_all()
 
 
 def is_mts_link(text: str) -> bool:
     return text.strip().startswith(MTS_LINK_PREFIX)
 
 
-def get_transcript_path(kind: str, args: tuple) -> Path:
+def get_transcript_path(kind: str, args: tuple, job_id: str | None = None) -> Path:
     if kind == "file":
         stem = Path(args[0]).stem
     else:
         event_session_id, _ = parse_mts_url(args[0])
         stem = event_session_id
-    return BASE_DIR / "results" / f"transcript_{stem}.txt"
+    suffix = f"_{job_id}" if job_id else ""
+    return BASE_DIR / "results" / f"transcript_{stem}{suffix}.txt"
 
 
-def _send_partial_result_sync(bot, chat_id: int, message_id: int, transcript_path: Path, main_loop) -> None:
-    async def _send() -> None:
-        if transcript_path.exists() and transcript_path.stat().st_size:
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text="📤 Отправляю расшифрованную часть...",
-                )
-            except Exception:
-                pass
-            with transcript_path.open("rb") as transcript_file:
-                await bot.send_document(
-                    chat_id=chat_id,
-                    document=transcript_file,
-                    filename=transcript_path.name,
-                    caption="⏹ Расшифровка остановлена. Файл содержит уже готовую часть.",
-                )
-            final_text = "⏹ Остановлено. Частичная расшифровка отправлена выше."
-        else:
-            final_text = "⏹ Расшифровка остановлена, готового текста пока нет."
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=final_text)
-        except Exception:
-            pass
+async def _edit_status(telegram_bot, chat_id: int, message_id: int, text: str) -> None:
+    try:
+        await telegram_bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+    except TelegramError as error:
+        log.debug("Не удалось обновить статус Telegram (%s)", type(error).__name__)
 
-    future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
-    future.result()
+
+def _deliver_transcript(telegram_bot, chat_id, message_id, transcript_path, main_loop, *, partial):
+    path = Path(transcript_path)
+    content = path.read_bytes() if path.is_file() else b""
+    if not partial and not path.is_file():
+        raise RuntimeError("Файл расшифровки не найден")
+
+    async def send():
+        if not partial and not content:
+            await _edit_status(telegram_bot, chat_id, message_id, "В записи не обнаружено речи.")
+            return
+        if content:
+            await _edit_status(telegram_bot, chat_id, message_id,
+                               "📤 Отправляю расшифрованную часть..." if partial else "📤 Отправляю файл...")
+            await telegram_bot.send_document(
+                chat_id=chat_id, document=content, filename=path.name,
+                caption="⏹ Расшифровка остановлена. Файл содержит уже готовую часть." if partial else "✅ Готово!",
+            )
+        text = ("⏹ Остановлено. Частичная расшифровка отправлена выше." if content
+                else "⏹ Расшифровка остановлена, готового текста пока нет.") if partial else "✅ Готово! Файл отправлен выше."
+        await _edit_status(telegram_bot, chat_id, message_id, text)
+
+    asyncio.run_coroutine_threadsafe(send(), main_loop).result(timeout=60)
+
+
+def _send_partial_result_sync(telegram_bot, chat_id: int, message_id: int, transcript_path: Path, main_loop) -> None:
+    _deliver_transcript(telegram_bot, chat_id, message_id, transcript_path, main_loop, partial=True)
 
 
 def check_access(update: Update) -> bool:
+    if update.effective_user is None:
+        return False
     if update.effective_user.id != ALLOWED_USER_ID:
         log.warning(f"Отклонён запрос от user_id={update.effective_user.id}")
         return False
@@ -289,22 +278,43 @@ def make_status_updater(bot, chat_id: int, message_id: int, main_loop: asyncio.A
     Безопасно вызывается из любого потока — шлёт задачу в основной event loop.
     Троттлит вызовы: не чаще раза в 5 секунд чтобы не получить RetryAfter от Telegram.
     """
-    import time
+    closed = threading.Event()
+    pending = set()
+    lock = threading.RLock()
     last_sent = [0.0]  # mutable для захвата в closure
     min_interval = 5.0
 
     def update_status(text: str) -> None:
+        if closed.is_set() or main_loop.is_closed():
+            return
         now = time.monotonic()
         if now - last_sent[0] < min_interval:
             return
         last_sent[0] = now
 
         async def _edit():
+            if closed.is_set():
+                return
             try:
                 await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-            except Exception as e:
-                log.warning(f"edit_message_text не удался: {e}")
-        asyncio.run_coroutine_threadsafe(_edit(), main_loop)
+            except TelegramError as error:
+                log.warning("Не удалось обновить статус Telegram (%s)", type(error).__name__)
+        with lock:
+            future = asyncio.run_coroutine_threadsafe(_edit(), main_loop)
+            pending.add(future)
+            future.add_done_callback(discard)
+
+    def discard(future):
+        with lock:
+            pending.discard(future)
+
+    def close():
+        closed.set()
+        with lock:
+            for future in list(pending):
+                future.cancel()
+
+    update_status.close = close
 
     return update_status
 
@@ -368,33 +378,96 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    jobs = [
-        (job_id, job)
-        for job_id, job in JOB_STATUS.items()
-        if job["user_id"] == user_id
-        and job["chat_id"] == chat_id
-        and job["status"] in {"queued", "running"}
-    ]
+    stopped_queued = stopped_running = False
+    with JOB_CONDITION:
+        jobs = [(job_id, job) for job_id, job in JOB_STATUS.items()
+                if job["user_id"] == user_id and job["chat_id"] == chat_id
+                and job["status"] in {"queued", "running"}]
+        for job_id, job in jobs:
+            job["cancel_requested"] = True
+            if job["status"] == "queued":
+                if job_id in JOB_QUEUE:
+                    JOB_QUEUE.remove(job_id)
+                job["status"] = "cancelled"
+                stopped_queued = True
+            else:
+                stopped_running = True
+        _refresh_queue_positions()
+        JOB_CONDITION.notify_all()
     if not jobs:
         await update.message.reply_text("Сейчас нет активной расшифровки.")
         return
-
-    stopped_queued = False
-    stopped_running = False
-    for job_id, job in jobs:
-        if job["status"] == "queued":
-            if job_id in JOB_QUEUE:
-                JOB_QUEUE.remove(job_id)
-            job["status"] = "cancelled"
-            stopped_queued = True
-            continue
-        job["cancel_requested"] = True
-        stopped_running = True
 
     if stopped_running:
         await update.message.reply_text("⏹ Останавливаю расшифровку и подготовлю уже готовую часть...")
     elif stopped_queued:
         await update.message.reply_text("⏹ Задание в очереди отменено.")
+
+
+def _start_job(job_id, kind, args, telegram_bot, chat_id, message_id, main_loop):
+    output_path = get_transcript_path(kind, args, job_id)
+    with JOB_CONDITION:
+        JOB_STATUS[job_id]["output_path"] = str(output_path)
+    update_status = make_status_updater(telegram_bot, chat_id, message_id, main_loop)
+
+    def worker():
+        acquired = False
+        outcome = "failed"
+        unavailable = False
+        delivered = False
+        try:
+            acquired = wait_for_job_slot(job_id)
+            if not acquired:
+                outcome = "cancelled"
+                return
+            try:
+                transcript = _run_pipeline_with_timeout(kind, args, update_status, job_id)
+            finally:
+                # Telegram delivery must not keep the next transcription waiting.
+                update_status.close()
+                release_job_slot(job_id, "delivering")
+            _send_result_sync(telegram_bot, chat_id, message_id, transcript, main_loop)
+            delivered = True
+            outcome = "completed"
+        except TranscriptionCancelled:
+            outcome = "cancelled"
+            if acquired:
+                _send_partial_result_sync(telegram_bot, chat_id, message_id, output_path, main_loop)
+                delivered = True
+        except Exception as error:
+            unavailable = _is_worker_unavailable(error)
+            if unavailable:
+                outcome = "unavailable"
+                _log_worker_unavailable(error, job_id)
+            else:
+                log.exception("Ошибка обработки задания %s", job_id)
+                _send_processing_failure(telegram_bot, chat_id, message_id, str(error), main_loop)
+        finally:
+            update_status.close()
+            try:
+                if not unavailable:
+                    _cleanup_remote_job(job_id)
+            finally:
+                try:
+                    if kind == "file":
+                        Path(args[0]).unlink(missing_ok=True)
+                    if delivered:
+                        output_path.unlink(missing_ok=True)
+                except OSError:
+                    log.warning("Не удалось удалить временные файлы задания %s", job_id)
+                finally:
+                    release_job_slot(job_id, outcome)
+
+    try:
+        thread = threading.Thread(target=worker, daemon=True)
+        with JOB_CONDITION:
+            JOB_STATUS[job_id]["thread"] = thread
+        thread.start()
+    except Exception:
+        if kind == "file":
+            Path(args[0]).unlink(missing_ok=True)
+        release_job_slot(job_id, "failed")
+        raise
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,45 +482,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    job_id = register_job("mts_link", update.effective_user.id, update.effective_chat.id, update.message.message_id)
-    if not acquire_job_slot(job_id):
-        await update.message.reply_text(
-            f"⏳ В данный момент уже идёт обработка другой записи. Ваша очередь: {get_queue_position(job_id)}."
-        )
+    try:
+        parse_mts_url(text)
+        job_id = register_job("mts_link", update.effective_user.id, update.effective_chat.id, update.message.message_id)
+    except (ValueError, OverflowError) as error:
+        await update.message.reply_text(str(error))
         return
-
-    status_msg = await update.message.reply_text("⏳ Принял. Начинаю обработку...")
-    main_loop = asyncio.get_running_loop()
-    update_status = make_status_updater(context.bot, update.effective_chat.id, status_msg.message_id, main_loop)
-
-    def _worker():
-        try:
-            transcript_path = _run_pipeline_with_timeout(
-                "url",
-                (text, WHISPER_MODEL),
-                update_status,
-                job_id,
-            )
-            _send_result_sync(context.bot, update.effective_chat.id, status_msg.message_id, transcript_path, main_loop)
-            _cleanup_remote_job(job_id)
-        except TranscriptionCancelled:
-            _send_partial_result_sync(
-                context.bot,
-                update.effective_chat.id,
-                status_msg.message_id,
-                get_transcript_path("url", (text, WHISPER_MODEL)),
-                main_loop,
-            )
-        except Exception as e:
-            if _is_worker_unavailable(e):
-                _log_worker_unavailable(e, job_id)
-            else:
-                log.exception(f"Ошибка пайплайна для {text}")
-                _send_processing_failure(context.bot, update.effective_chat.id, status_msg.message_id, str(e), main_loop)
-        finally:
-            release_job_slot(job_id)
-
-    threading.Thread(target=_worker, daemon=True).start()
+    try:
+        status_msg = await update.message.reply_text(
+            f"⏳ Принял. Задание в очереди: {get_queue_position(job_id)}."
+        )
+        _start_job(job_id, "url", (text, WHISPER_MODEL), context.bot,
+                   update.effective_chat.id, status_msg.message_id, asyncio.get_running_loop())
+    except Exception:
+        release_job_slot(job_id, "failed")
+        raise
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -494,22 +543,27 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    job_id = register_job("file", message.from_user.id, update.effective_chat.id, message.message_id)
-    if not acquire_job_slot(job_id):
-        await message.reply_text(
-            f"⏳ В данный момент уже идёт обработка другой записи. Ваша очередь: {get_queue_position(job_id)}."
-        )
+    try:
+        job_id = register_job("file", message.from_user.id, update.effective_chat.id, message.message_id)
+    except OverflowError as error:
+        await message.reply_text(str(error))
         return
-
-    status_msg = await message.reply_text("⏳ Принял. Скачиваю файл...")
-    main_loop = asyncio.get_running_loop()
-    update_status = make_status_updater(context.bot, update.effective_chat.id, status_msg.message_id, main_loop)
+    try:
+        status_msg = await message.reply_text(
+            f"⏳ Принял. Задание в очереди: {get_queue_position(job_id)}. Скачиваю файл..."
+        )
+    except Exception:
+        release_job_slot(job_id, "failed")
+        raise
 
     # Скачиваем файл в основном loop, потом передаём путь в поток
     suffix = Path(filename).suffix or ".mp4"
-    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-    tmp_path = tmp.name
-    tmp.close()
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+    except OSError:
+        release_job_slot(job_id, "failed")
+        raise
 
     try:
         tg_file = await context.bot.get_file(file_obj.file_id)
@@ -519,7 +573,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             os.unlink(tmp_path)
         except OSError:
             pass
-        release_job_slot(job_id)
+        release_job_slot(job_id, "failed")
         if "File is too big" in str(error):
             await status_msg.edit_text(
                 "Файл слишком большой для скачивания через Telegram (лимит 20 MB).\n"
@@ -534,45 +588,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             os.unlink(tmp_path)
         except OSError:
             pass
-        release_job_slot(job_id)
+        release_job_slot(job_id, "failed")
         log.exception(f"Не удалось скачать файл {filename}")
         await status_msg.edit_text("❌ Не удалось скачать файл из Telegram.")
         return
     log.info(f"Файл скачан: {tmp_path} ({filename})")
 
 
-    def _worker():
-        try:
-            transcript_path = _run_pipeline_with_timeout(
-                "file",
-                (tmp_path, WHISPER_MODEL),
-                update_status,
-                job_id,
-            )
-            _send_result_sync(context.bot, update.effective_chat.id, status_msg.message_id, transcript_path, main_loop)
-            _cleanup_remote_job(job_id)
-        except TranscriptionCancelled:
-            _send_partial_result_sync(
-                context.bot,
-                update.effective_chat.id,
-                status_msg.message_id,
-                get_transcript_path("file", (tmp_path, WHISPER_MODEL)),
-                main_loop,
-            )
-        except Exception as e:
-            if _is_worker_unavailable(e):
-                _log_worker_unavailable(e, job_id)
-            else:
-                log.exception(f"Ошибка при обработке файла {filename}")
-                _send_processing_failure(context.bot, update.effective_chat.id, status_msg.message_id, str(e), main_loop)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-            release_job_slot(job_id)
-
-    threading.Thread(target=_worker, daemon=True).start()
+    _start_job(job_id, "file", (tmp_path, WHISPER_MODEL), context.bot,
+               update.effective_chat.id, status_msg.message_id, asyncio.get_running_loop())
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -584,27 +608,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             log.exception("Не удалось отправить сообщение об ошибке")
 
 
-def _send_result_sync(bot, chat_id: int, message_id: int, transcript_path: str, main_loop: asyncio.AbstractEventLoop) -> None:
-    """Отправляет файл с результатом из рабочего потока в основной loop."""
-    async def _send():
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="📤 Отправляю файл...")
-        except Exception:
-            pass
-        with open(transcript_path, "rb") as f:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=f,
-                filename=Path(transcript_path).name,
-                caption="✅ Готово!",
-            )
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text="✅ Готово! Файл отправлен выше.")
-        except Exception:
-            pass
-
-    future = asyncio.run_coroutine_threadsafe(_send(), main_loop)
-    future.result()  # ждём завершения перед выходом из потока
+def _send_result_sync(telegram_bot, chat_id: int, message_id: int, transcript_path: str, main_loop) -> None:
+    _deliver_transcript(telegram_bot, chat_id, message_id, transcript_path, main_loop, partial=False)
 
 
 BOT_COMMANDS = (
@@ -632,6 +637,7 @@ def main() -> None:
     if not PROCESSOR_URL or not PROCESSOR_API_KEY:
         raise RuntimeError("PROCESSOR_URL и PROCESSOR_API_KEY должны быть заданы в .env")
 
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     app = Application.builder().token(BOT_TOKEN).post_init(configure_commands).build()
 
     for command, _, callback in BOT_COMMANDS:

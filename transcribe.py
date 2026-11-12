@@ -17,19 +17,15 @@ import os
 import sys
 import time
 
+from common import TRANSCRIBE_OPTIONS, format_timestamp
+from pipeline import get_model
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
-
-
-def format_timestamp(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def transcribe(input_path: str, model_name: str, language: str | None) -> None:
@@ -41,12 +37,11 @@ def transcribe(input_path: str, model_name: str, language: str | None) -> None:
 
     log.info(f"Загрузка модели {model_name}...")
     try:
-        from faster_whisper import WhisperModel
+        model = get_model(model_name, workers=1)
     except ImportError:
         log.error("faster-whisper не установлен. Запусти: pip install faster-whisper")
         sys.exit(1)
 
-    model = WhisperModel(model_name, device="cpu", compute_type="int8")
     log.info("Модель загружена.")
 
     lang_arg = None if language == "auto" else language
@@ -55,10 +50,7 @@ def transcribe(input_path: str, model_name: str, language: str | None) -> None:
 
     segments, info = model.transcribe(
         input_path,
-        language=lang_arg,
-        beam_size=5,
-        vad_filter=True,           # фильтр тишины — ускоряет обработку
-        vad_parameters={"min_silence_duration_ms": 500},
+        **(TRANSCRIBE_OPTIONS | {"language": lang_arg}),
     )
 
     log.info(f"Определён язык: {info.language} (вероятность {info.language_probability:.0%})")

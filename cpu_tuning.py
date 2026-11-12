@@ -15,15 +15,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from common import TRANSCRIBE_OPTIONS
+
 log = logging.getLogger(__name__)
 GIB = 1024 ** 3
 CACHE_VERSION = 2
-TRANSCRIBE_OPTIONS = {
-    "language": "ru",
-    "beam_size": 5,
-    "vad_filter": True,
-    "vad_parameters": {"min_silence_duration_ms": 500},
-}
+
 
 
 @dataclass(frozen=True)

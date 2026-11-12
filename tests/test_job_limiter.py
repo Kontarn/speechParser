@@ -146,7 +146,8 @@ class JobLimiterTests(unittest.TestCase):
         self.addCleanup(pipeline.clear_model)
         with tempfile.TemporaryDirectory() as directory:
             def extract(command, **kwargs):
-                Path(command[-1]).write_bytes(b"wav")
+                Path(command[-1]).write_bytes(b"wav" + bytes(64))
+                return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
                 patch.dict("sys.modules", {"faster_whisper": SimpleNamespace(WhisperModel=constructor)}),
@@ -175,7 +176,8 @@ class JobLimiterTests(unittest.TestCase):
         self.addCleanup(pipeline.clear_model)
         with tempfile.TemporaryDirectory() as directory:
             def extract(command, **kwargs):
-                Path(command[-1]).write_bytes(b"wav")
+                Path(command[-1]).write_bytes(b"wav" + bytes(64))
+                return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
                 patch.dict("os.environ", {"WHISPER_AUTOTUNE": "0"}),
@@ -206,7 +208,7 @@ class JobLimiterTests(unittest.TestCase):
                 return original_executor(max_workers=max_workers)
 
             def fake_ffmpeg(command, **kwargs):
-                Path(command[-1]).write_bytes(b"wav")
+                Path(command[-1]).write_bytes(b"wav" + bytes(64))
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             def fake_get_model(model_name, workers=None, cpu_threads=None):

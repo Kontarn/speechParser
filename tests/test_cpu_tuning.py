@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import cpu_tuning
-from cpu_tuning import CpuConfig, GIB
+from cpu_tuning import GIB, CpuConfig
 
 
 class CpuTuningTests(unittest.TestCase):
@@ -28,11 +28,11 @@ class CpuTuningTests(unittest.TestCase):
         self.addCleanup(platform_patch.stop)
 
     def select(self, **kwargs):
-        defaults = dict(
-            model_name="large-v3", chunk_files=[f"chunk{i}.wav" for i in range(40)],
-            cpu_count=16, available_memory=32 * GIB, fallback=CpuConfig(4, 4),
-            cache_dir=self.cache_dir,
-        )
+        defaults = {
+            "model_name": "large-v3", "chunk_files": [f"chunk{i}.wav" for i in range(40)],
+            "cpu_count": 16, "available_memory": 32 * GIB, "fallback": CpuConfig(4, 4),
+            "cache_dir": self.cache_dir,
+        }
         return cpu_tuning.select_cpu_config(**(defaults | kwargs))
 
     @staticmethod
@@ -129,10 +129,10 @@ class CpuTuningTests(unittest.TestCase):
     def test_manual_settings_disabled_tuning_and_concurrent_jobs_skip_probes(self):
         for override in ({"WHISPER_WORKERS": "4"}, {"WHISPER_CPU_THREADS": "1"},
                          {"WHISPER_AUTOTUNE": "0"}, {"SERVER_MAX_CONCURRENT_JOBS": "2"}):
-            with self.subTest(override=override), patch.dict(os.environ, override):
-                with patch.object(cpu_tuning, "_run_probe") as probe:
-                    self.assertEqual(self.select(), CpuConfig(4, 4))
-                    probe.assert_not_called()
+            with (self.subTest(override=override), patch.dict(os.environ, override),
+                  patch.object(cpu_tuning, "_run_probe") as probe):
+                self.assertEqual(self.select(), CpuConfig(4, 4))
+                probe.assert_not_called()
         self.assertEqual(self.select(available_memory=None), CpuConfig(4, 4))
         with patch.object(cpu_tuning, "_run_probe") as probe:
             self.assertEqual(self.select(chunk_files=["a.wav", "b.wav"]), CpuConfig(4, 4))
@@ -143,10 +143,10 @@ class CpuTuningTests(unittest.TestCase):
                          {"cpu_seconds": float("nan")}, {"cpu_seconds": -1}):
             result = self.result() | override
             completed = subprocess.CompletedProcess([], 0, json.dumps(result), "")
-            with patch.object(cpu_tuning.subprocess, "run", return_value=completed):
-                with self.assertRaises(ValueError):
-                    cpu_tuning._run_probe("large-v3", CpuConfig(4, 4), ["sample.wav"],
-                                          16, 30 * GIB, 180)
+            with (patch.object(cpu_tuning.subprocess, "run", return_value=completed),
+                  self.assertRaises(ValueError)):
+                cpu_tuning._run_probe("large-v3", CpuConfig(4, 4), ["sample.wav"],
+                                      16, 30 * GIB, 180)
 
     @unittest.skipUnless(sys.platform == "linux", "Linux probe isolation")
     def test_real_probe_subprocess_exhausts_lazy_segments(self):

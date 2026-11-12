@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import queue
 import shutil
+import signal
 import threading
 import time
 import uuid
@@ -18,7 +19,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from dotenv import load_dotenv
 
-from pipeline import BASE_DIR, parse_mts_url, run_pipeline, run_pipeline_file
+from common import BASE_DIR, SUPPORTED_EXTENSIONS, parse_mts_url
+from pipeline import run_pipeline, run_pipeline_file
+from process_control import start_job_session, stop_process
+from transcript_parts import assemble_partial
 
 load_dotenv(Path(__file__).resolve().with_name(".env.server"))
 
@@ -38,7 +42,7 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("SERVER_MAX_CONCURRENT_JOBS", "1")))
 JOB_TIMEOUT_SECONDS = max(1, int(os.getenv("TRANSCRIPTION_TIMEOUT_SECONDS", str(3 * 60 * 60))))
 JOB_RETENTION_SECONDS = max(3600, int(os.getenv("JOB_RETENTION_SECONDS", str(24 * 60 * 60))))
-SUPPORTED_EXTENSIONS = {".mp4", ".mp3", ".wav", ".m4a", ".ogg", ".webm", ".mkv", ".avi", ".mov"}
+MAX_PENDING_JOBS = max(MAX_CONCURRENT_JOBS, int(os.getenv("SERVER_MAX_PENDING_JOBS", "32")))
 
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -52,7 +56,7 @@ def _cleanup_expired_jobs() -> None:
     expired_paths = []
     with JOBS_LOCK:
         for job_id, job in list(JOBS.items()):
-            if job["status"] in {"completed", "cancelled", "failed"} and now - job["created_at"] > JOB_RETENTION_SECONDS:
+            if job["status"] in {"completed", "cancelled", "failed"} and now - job.get("finished_at", job["created_at"]) > JOB_RETENTION_SECONDS:
                 JOBS.pop(job_id, None)
                 expired_paths.append(JOBS_DIR / job_id)
         known_job_ids = set(JOBS)
@@ -69,6 +73,8 @@ def _cleanup_expired_jobs() -> None:
 
 
 def _pipeline_process_target(kind, args, output_path, status_queue, result_queue) -> None:
+    start_job_session()
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     def process_status(message: str) -> None:
         status_queue.put(message)
 
@@ -85,6 +91,7 @@ def _pipeline_process_target(kind, args, output_path, status_queue, result_queue
             )
         result_queue.put(("result", result))
     except Exception as error:
+        log.exception("Пайплайн задания завершился с ошибкой")
         result_queue.put(("error", f"{type(error).__name__}: {error}"))
 
 
@@ -93,6 +100,8 @@ def _set_job(job_id: str, **values) -> None:
         job = JOBS.get(job_id)
         if job:
             job.update(values)
+            if values.get("status") in {"completed", "cancelled", "failed"}:
+                job["finished_at"] = time.time()
 
 
 def _run_job(job_id: str) -> None:
@@ -124,19 +133,13 @@ def _run_job(job_id: str) -> None:
 
         while process.is_alive():
             if job["cancel_event"].is_set():
-                process.terminate()
-                process.join(timeout=10)
-                if process.is_alive():
-                    process.kill()
-                    process.join()
+                stop_process(process)
+                assemble_partial(job["output_path"])
                 _set_job(job_id, status="cancelled", message="Расшифровка остановлена.")
                 return
             if time.monotonic() >= deadline:
-                process.terminate()
-                process.join(timeout=10)
-                if process.is_alive():
-                    process.kill()
-                    process.join()
+                stop_process(process)
+                assemble_partial(job["output_path"])
                 _set_job(
                     job_id,
                     status="failed",
@@ -169,9 +172,7 @@ def _run_job(job_id: str) -> None:
         _set_job(job_id, status="failed", error=f"{type(error).__name__}: {error}")
     finally:
         if process is not None:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=10)
+            stop_process(process)
             process.close()
         for result_queue_item in (status_queue, result_queue):
             if result_queue_item is not None:
@@ -181,6 +182,7 @@ def _run_job(job_id: str) -> None:
 
 class ProcessorHandler(BaseHTTPRequestHandler):
     server_version = "SpeechParserProcessor/1.0"
+    protocol_version = "HTTP/1.1"
 
     def log_message(self, format_string, *args) -> None:
         log.info("%s - %s", self.address_string(), format_string % args)
@@ -190,12 +192,16 @@ class ProcessorHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if status >= 400:
+            # Rejected uploads can still have unread bytes on the socket.
+            self.close_connection = True
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _authorized(self) -> bool:
         expected = f"Bearer {API_KEY}"
-        return bool(API_KEY) and hmac.compare_digest(self.headers.get("Authorization", ""), expected)
+        return bool(API_KEY) and hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected.encode())
 
     def _require_auth(self) -> bool:
         if self._authorized():
@@ -203,27 +209,50 @@ class ProcessorHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "Требуется корректный API-ключ."})
         return False
 
-    def _create_job(self, kind: str, args: tuple, input_path: str | None = None) -> str:
-        _cleanup_expired_jobs()
-        job_id = uuid.uuid4().hex
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
+    def handle(self):
+        try:
+            super().handle()
+        except (TimeoutError, BrokenPipeError, ConnectionResetError):
+            log.info("HTTP-клиент отключился или не завершил запрос вовремя")
+
+    def _start_job(self, job_id):
+        thread = threading.Thread(target=_run_job, args=(job_id,), daemon=True)
+        _set_job(job_id, thread=thread)
+        try:
+            thread.start()
+        except Exception:
+            with JOBS_LOCK:
+                JOBS.pop(job_id, None)
+            shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
+            raise
+
+    def _create_job(self, kind: str, args: tuple, input_path: str | None = None,
+                    *, job_id: str | None = None, start: bool = True) -> str:
+        job_id = job_id or uuid.uuid4().hex
         job_dir = JOBS_DIR / job_id
-        job_dir.mkdir(parents=True)
-        output_path = str(job_dir / "transcript.txt")
-        Path(output_path).write_text("", encoding="utf-8")
         with JOBS_LOCK:
-            JOBS[job_id] = {
-                "kind": kind,
-                "args": args,
-                "input_path": input_path,
-                "output_path": output_path,
-                "status": "queued",
-                "message": "Задание в очереди сервера.",
-                "error": None,
-                "created_at": time.time(),
-                "cancel_event": threading.Event(),
-                "process": None,
-            }
-        threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+            pending = sum(job["status"] in {"uploading", "queued", "running"} for job in JOBS.values())
+            if pending >= MAX_PENDING_JOBS:
+                raise OverflowError("Очередь воркера заполнена. Повтори запрос позже.")
+            try:
+                job_dir.mkdir(parents=True)
+                output_path = str(job_dir / "transcript.txt")
+                Path(output_path).write_text("", encoding="utf-8")
+                JOBS[job_id] = {
+                    "kind": kind, "args": args, "input_path": input_path,
+                    "output_path": output_path, "status": "queued" if start else "uploading",
+                    "message": "Задание в очереди сервера.", "error": None,
+                    "created_at": time.time(), "cancel_event": threading.Event(), "process": None,
+                }
+            except Exception:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise
+        if start:
+            self._start_job(job_id)
         return job_id
 
     def do_GET(self) -> None:
@@ -248,20 +277,27 @@ class ProcessorHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "result":
             with JOBS_LOCK:
                 job = JOBS.get(parts[1])
-                result_path = Path(job["output_path"]) if job else None
-                result_status = job["status"] if job else None
-            if result_path is None:
+                if job is None:
+                    result_file = None
+                    ready = False
+                else:
+                    ready = job["status"] in {"completed", "cancelled"}
+                    try:
+                        result_file = open(job["output_path"], "rb") if ready else None  # noqa: SIM115 -- opened under lock, closed after streaming
+                    except OSError:
+                        result_file = None
+            if job is None:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "Задание не найдено."})
                 return
-            if result_status not in {"completed", "cancelled"} or not result_path.is_file():
+            if result_file is None:
                 self._send_json(HTTPStatus.CONFLICT, {"error": "Результат пока не готов."})
                 return
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Disposition", f'attachment; filename="transcript_{parts[1]}.txt"')
-            self.send_header("Content-Length", str(result_path.stat().st_size))
-            self.end_headers()
-            with result_path.open("rb") as result_file:
+            with result_file:
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="transcript_{parts[1]}.txt"')
+                self.send_header("Content-Length", str(os.fstat(result_file.fileno()).st_size))
+                self.end_headers()
                 while chunk := result_file.read(64 * 1024):
                     self.wfile.write(chunk)
             return
@@ -281,18 +317,23 @@ class ProcessorHandler(BaseHTTPRequestHandler):
                 payload = json.loads(self.rfile.read(length))
                 url = payload["url"]
                 if not isinstance(url, str):
-                    raise ValueError("Поле url должно быть строкой.")
+                    raise TypeError("Поле url должно быть строкой.")
                 parse_mts_url(url)
-                model = str(payload.get("model") or DEFAULT_MODEL)
+                model = payload.get("model") or DEFAULT_MODEL
+                if not isinstance(model, str):
+                    raise TypeError("Поле model должно быть строкой.")
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
                 return
-            job_id = self._create_job("url", (url, model))
+            try:
+                job_id = self._create_job("url", (url, model))
+            except OverflowError as error:
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)})
+                return
             self._send_json(HTTPStatus.ACCEPTED, {"job_id": job_id})
             return
 
         if parsed.path == "/jobs/file":
-            _cleanup_expired_jobs()
             query = parse_qs(parsed.query)
             filename = Path(unquote(query.get("filename", ["upload"])[0])).name
             extension = Path(filename).suffix.lower()
@@ -309,38 +350,33 @@ class ProcessorHandler(BaseHTTPRequestHandler):
 
             job_id = uuid.uuid4().hex
             job_dir = JOBS_DIR / job_id
-            job_dir.mkdir(parents=True)
             input_path = job_dir / f"input{extension}"
+            model = query.get("model", [DEFAULT_MODEL])[0]
+            try:
+                self._create_job("file", (str(input_path), model), str(input_path), job_id=job_id, start=False)
+            except OverflowError as error:
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)})
+                return
             remaining = length
             try:
                 with input_path.open("wb") as uploaded_file:
                     while remaining:
+                        if JOBS[job_id]["cancel_event"].is_set():
+                            raise OSError("Загрузка отменена")
                         chunk = self.rfile.read(min(64 * 1024, remaining))
                         if not chunk:
                             raise OSError("Загрузка файла оборвалась.")
                         uploaded_file.write(chunk)
                         remaining -= len(chunk)
             except OSError as error:
+                with JOBS_LOCK:
+                    JOBS.pop(job_id, None)
+                shutil.rmtree(job_dir, ignore_errors=True)
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
                 return
 
-            model = query.get("model", [DEFAULT_MODEL])[0]
-            output_path = job_dir / "transcript.txt"
-            output_path.write_text("", encoding="utf-8")
-            with JOBS_LOCK:
-                JOBS[job_id] = {
-                    "kind": "file",
-                    "args": (str(input_path), model),
-                    "input_path": str(input_path),
-                    "output_path": str(output_path),
-                    "status": "queued",
-                    "message": "Задание в очереди сервера.",
-                    "error": None,
-                    "created_at": time.time(),
-                    "cancel_event": threading.Event(),
-                    "process": None,
-                }
-            threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+            _set_job(job_id, status="queued")
+            self._start_job(job_id)
             self._send_json(HTTPStatus.ACCEPTED, {"job_id": job_id})
             return
 
@@ -357,7 +393,7 @@ class ProcessorHandler(BaseHTTPRequestHandler):
         with JOBS_LOCK:
             job_id = parts[1]
             job = JOBS.get(job_id)
-            if job and job["status"] in {"queued", "running"}:
+            if job and job["status"] in {"uploading", "queued", "running"}:
                 job["cancel_event"].set()
                 status = "cancellation_requested"
             elif job:
@@ -376,6 +412,10 @@ class ProcessorHandler(BaseHTTPRequestHandler):
 def main() -> None:
     if not API_KEY:
         raise RuntimeError("PROCESSOR_API_KEY не задан")
+    def shutdown(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, shutdown)
     missing_tools = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
     if missing_tools:
         raise RuntimeError(
@@ -383,6 +423,17 @@ def main() -> None:
             "Установи пакет ffmpeg (он включает ffprobe) и перезапусти обработчик."
         )
     _cleanup_expired_jobs()
+    maintenance_stop = threading.Event()
+
+    def maintenance():
+        while not maintenance_stop.wait(60):
+            try:
+                _cleanup_expired_jobs()
+            except OSError:
+                log.warning("Не удалось очистить старые задания", exc_info=True)
+
+    threading.Thread(target=maintenance, daemon=True).start()
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     server = ThreadingHTTPServer((HOST, PORT), ProcessorHandler)
     log.info("Удалённый обработчик запущен на %s:%s; одновременно заданий: %s", HOST, PORT, MAX_CONCURRENT_JOBS)
     try:
@@ -390,6 +441,16 @@ def main() -> None:
     except KeyboardInterrupt:
         log.info("Остановка обработчика")
     finally:
+        maintenance_stop.set()
+        with JOBS_LOCK:
+            active_jobs = list(JOBS.values())
+            for job in active_jobs:
+                job["cancel_event"].set()
+        deadline = time.monotonic() + 12
+        for job in active_jobs:
+            thread = job.get("thread")
+            if thread:
+                thread.join(timeout=max(0, deadline - time.monotonic()))
         server.server_close()
 
 

@@ -13,7 +13,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
-COPY audio_downloader.py cpu_tuning.py pipeline.py worker_server.py ./
+COPY common.py media.py transcript_parts.py process_control.py mts_fallback.py audio_downloader.py cpu_tuning.py pipeline.py worker_server.py ./
 RUN mkdir -p /app/tmp
 
 EXPOSE 8080

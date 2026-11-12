@@ -1,6 +1,6 @@
 import asyncio
-import threading
 import tempfile
+import threading
 import unittest
 import uuid
 from http.server import ThreadingHTTPServer
@@ -127,7 +127,7 @@ class RemoteProcessingTests(unittest.TestCase):
                         failure.assert_not_called()
                         result.assert_not_called()
                         self.assertEqual(bot.ACTIVE_JOBS, 0)
-                        self.assertTrue(all(job["status"] == "done" for job in bot.JOB_STATUS.values()))
+                        self.assertTrue(all(job["status"] == "unavailable" for job in bot.JOB_STATUS.values()))
                         self.assertEqual(len(logs.records), 1)
                         self.assertIn("Воркер недоступен", logs.output[0])
                         self.assertIsNone(logs.records[0].exc_info)

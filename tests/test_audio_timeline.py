@@ -45,7 +45,7 @@ class AudioTimelineTests(unittest.TestCase):
         metadata = {"eventLogs": events}
         if duration is not None:
             metadata["duration"] = duration
-        downloader = Mock(side_effect=lambda url, path, session: shutil.copyfile(sources[url], path))
+        downloader = Mock(side_effect=lambda url, path, session, **kwargs: shutil.copyfile(sources[url], path))
         job_dir = self.root / "job"
         job_dir.mkdir()
         with (
@@ -151,6 +151,25 @@ class AudioTimelineTests(unittest.TestCase):
         self.assertAlmostEqual(self.amplitude(self.output, 0.5), 0, delta=2)
         self.assertGreater(self.amplitude(self.output, 1.5), 500)
         self.assertAlmostEqual(self.amplitude(self.output, 2.8), 0, delta=2)
+
+    def test_head_not_supported_falls_back_to_streamed_get_and_reuses_client(self):
+        import httpx
+
+        methods = []
+
+        def handle(request):
+            methods.append(request.method)
+            if request.method == "HEAD":
+                return httpx.Response(405)
+            return httpx.Response(200, headers={"Content-Type": "audio/wav"}, content=b"media")
+
+        with httpx.Client(transport=httpx.MockTransport(handle)) as client:
+            content_type = audio_downloader._get_content_type("https://example.test/audio", None, client=client)
+            target = str(self.root / "download")
+            audio_downloader._download_chunk("https://example.test/audio", target, None, client=client)
+        self.assertEqual(content_type, "audio/wav")
+        self.assertEqual(Path(target).read_bytes(), b"media")
+        self.assertEqual(methods, ["HEAD", "GET", "GET"])
 
 
 if __name__ == "__main__":
