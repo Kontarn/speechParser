@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import bot
@@ -78,7 +79,7 @@ class JobLimiterTests(unittest.TestCase):
         )
         pipeline.clear_model()
 
-    def test_parallel_model_workers_round_up_cpu_threads(self):
+    def test_automatic_threads_use_all_cpu_within_worker_limit(self):
         whisper_model = Mock(return_value=object())
         fake_module = Mock(WhisperModel=whisper_model)
         pipeline.clear_model()
@@ -93,10 +94,103 @@ class JobLimiterTests(unittest.TestCase):
             "large-v3",
             device="cpu",
             compute_type="int8",
-            num_workers=7,
-            cpu_threads=3,
+            num_workers=4,
+            cpu_threads=4,
         )
         pipeline.clear_model()
+
+    def test_default_cpu_config_respects_short_jobs_and_manual_threads(self):
+        with patch.dict("os.environ", {"WHISPER_CPU_THREADS": "auto"}):
+            self.assertEqual(pipeline.get_default_cpu_config(16, 3), pipeline.CpuConfig(2, 8))
+        with patch.dict("os.environ", {"WHISPER_CPU_THREADS": "1"}):
+            self.assertEqual(pipeline.get_default_cpu_config(16, 7), pipeline.CpuConfig(7, 1))
+        with patch.dict("os.environ", {"WHISPER_CPU_THREADS": "invalid"}):
+            self.assertEqual(pipeline.get_default_cpu_config(16, 7), pipeline.CpuConfig(4, 4))
+
+    def test_model_cache_includes_cpu_threads(self):
+        whisper_model = Mock(side_effect=lambda *args, **kwargs: object())
+        pipeline.clear_model()
+        self.addCleanup(pipeline.clear_model)
+        with (
+            patch.dict("sys.modules", {"faster_whisper": SimpleNamespace(WhisperModel=whisper_model)}),
+            patch.object(pipeline, "_get_cpu_count", return_value=16),
+        ):
+            first = pipeline.get_model("medium", workers=4, cpu_threads=4)
+            self.assertIs(pipeline.get_model("medium", workers=4, cpu_threads=4), first)
+            self.assertIsNot(pipeline.get_model("medium", workers=4, cpu_threads=2), first)
+        self.assertEqual(whisper_model.call_count, 2)
+
+    def test_unlimited_cgroup_v1_does_not_reduce_cpu_count_to_one(self):
+        def read_cgroup(path, *args, **kwargs):
+            if str(path).endswith("cpu.cfs_quota_us"):
+                return "-1"
+            if str(path).endswith("cpu.cfs_period_us"):
+                return "100000"
+            raise OSError("cgroup v2 is not mounted")
+
+        with (
+            patch.object(pipeline.os, "cpu_count", return_value=16),
+            patch.object(pipeline.os, "sched_getaffinity", return_value=set(range(16)), create=True),
+            patch.object(Path, "read_text", read_cgroup),
+        ):
+            self.assertEqual(pipeline._get_cpu_count(), 16)
+
+    def test_tuned_parallelism_is_used_for_all_chunks(self):
+        model = Mock()
+        model.transcribe.side_effect = lambda *args, **kwargs: (
+            iter([SimpleNamespace(text="текст")]),
+            SimpleNamespace(duration=120, language="ru", language_probability=1),
+        )
+        constructor = Mock(return_value=model)
+        pipeline.clear_model()
+        self.addCleanup(pipeline.clear_model)
+        with tempfile.TemporaryDirectory() as directory:
+            def extract(command, **kwargs):
+                Path(command[-1]).write_bytes(b"wav")
+
+            with (
+                patch.dict("sys.modules", {"faster_whisper": SimpleNamespace(WhisperModel=constructor)}),
+                patch.object(pipeline, "BASE_DIR", Path(directory)),
+                patch.object(pipeline, "_get_cpu_count", return_value=16),
+                patch.object(pipeline, "get_worker_count", return_value=2),
+                patch.object(pipeline, "get_media_duration", return_value=1201),
+                patch.object(pipeline.subprocess, "run", side_effect=extract),
+                patch.object(pipeline, "select_cpu_config", return_value=pipeline.CpuConfig(8, 1)),
+            ):
+                output = Path(directory) / "result.txt"
+                pipeline.transcribe_file("input.wav", "large-v3", str(output))
+                self.assertEqual(output.read_text(), "текст\n" * 11)
+        constructor.assert_called_once_with(
+            "large-v3", device="cpu", compute_type="int8", num_workers=8, cpu_threads=1,
+        )
+
+    def test_single_worker_reuses_model_across_chunks(self):
+        model = Mock()
+        model.transcribe.side_effect = lambda *args, **kwargs: (
+            iter([SimpleNamespace(text="текст")]),
+            SimpleNamespace(duration=120, language="ru", language_probability=1),
+        )
+        constructor = Mock(return_value=model)
+        pipeline.clear_model()
+        self.addCleanup(pipeline.clear_model)
+        with tempfile.TemporaryDirectory() as directory:
+            def extract(command, **kwargs):
+                Path(command[-1]).write_bytes(b"wav")
+
+            with (
+                patch.dict("os.environ", {"WHISPER_AUTOTUNE": "0"}),
+                patch.dict("sys.modules", {"faster_whisper": SimpleNamespace(WhisperModel=constructor)}),
+                patch.object(pipeline, "BASE_DIR", Path(directory)),
+                patch.object(pipeline, "_get_cpu_count", return_value=4),
+                patch.object(pipeline, "get_worker_count", return_value=1),
+                patch.object(pipeline, "get_media_duration", return_value=361),
+                patch.object(pipeline.subprocess, "run", side_effect=extract),
+            ):
+                output = Path(directory) / "result.txt"
+                pipeline.transcribe_file("input.wav", "large-v3", str(output))
+                self.assertEqual(output.read_text(), "текст\n" * 4)
+        constructor.assert_called_once()
+        self.assertIsNone(pipeline._model)
 
     def test_audio_chunks_are_extracted_in_parallel_and_ordered(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -115,7 +209,7 @@ class JobLimiterTests(unittest.TestCase):
                 Path(command[-1]).write_bytes(b"wav")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            def fake_get_model(model_name, workers=None):
+            def fake_get_model(model_name, workers=None, cpu_threads=None):
                 pipeline._model_workers = workers
                 return object()
 
@@ -123,10 +217,11 @@ class JobLimiterTests(unittest.TestCase):
                 Path(output_path).write_text(f"part{kwargs['chunk_number']}\n", encoding="utf-8")
 
             with (
+                patch.dict("os.environ", {"WHISPER_AUTOTUNE": "0"}),
                 patch.object(pipeline, "BASE_DIR", Path(temp_dir)),
                 patch.object(pipeline, "get_media_duration", return_value=1201),
-                patch.object(pipeline, "_get_cpu_count", return_value=4),
-                patch.object(pipeline, "get_worker_count", return_value=4),
+                patch.object(pipeline, "_get_cpu_count", return_value=16),
+                patch.object(pipeline, "get_worker_count", return_value=7),
                 patch.object(pipeline, "get_model", side_effect=fake_get_model),
                 patch.object(pipeline, "_transcribe_one_file", side_effect=fake_transcribe_one_file),
                 patch.object(pipeline.subprocess, "run", side_effect=fake_ffmpeg),
@@ -136,7 +231,7 @@ class JobLimiterTests(unittest.TestCase):
                     str(input_path), "medium", str(output_path), status_updates.append
                 )
 
-            self.assertEqual(max_workers_used, [4, 4])
+            self.assertEqual(max_workers_used, [11, 4])
             expected_output = "".join(f"part{part}\n" for part in range(1, 12))
             self.assertEqual(output_path.read_text(encoding="utf-8"), expected_output)
             self.assertEqual(status_updates[0], "🎙 Готово частей: 0/11 · 0,0/20,0 мин")

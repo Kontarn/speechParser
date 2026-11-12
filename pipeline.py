@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from cpu_tuning import CpuConfig, TRANSCRIBE_OPTIONS, balanced_cpu_config, select_cpu_config
+
 log = logging.getLogger(__name__)
 
 # Базовая директория для временных файлов и результатов
@@ -35,6 +37,7 @@ MTS_URL_PATTERN = re.compile(
 _model = None
 _model_name: Optional[str] = None
 _model_workers = 1
+_model_cpu_threads = 1
 TRANSCRIPTION_CHUNK_SECONDS = 120
 _GIB = 1024 ** 3
 _WORKER_MEMORY_GIB = {
@@ -74,6 +77,8 @@ def _get_cpu_count() -> int:
             else:
                 quota = Path(quota_path).read_text().strip()
                 period = Path(period_path).read_text().strip()
+                if int(quota) < 0:  # cgroup v1: -1 means unlimited.
+                    continue
             quota_cpus = max(1, int(quota) // int(period))
             cpu_count = min(cpu_count, quota_cpus)
         except (OSError, ValueError, ZeroDivisionError):
@@ -155,10 +160,11 @@ def get_worker_count(model_name: str) -> int:
 
 
 def clear_model() -> None:
-    global _model, _model_name, _model_workers
+    global _model, _model_name, _model_workers, _model_cpu_threads
     _model = None
     _model_name = None
     _model_workers = 1
+    _model_cpu_threads = 1
     gc.collect()
 
 
@@ -176,13 +182,34 @@ def build_chunk_ranges(duration: float, chunk_seconds: int = 600) -> list[tuple[
     return ranges
 
 
-def get_model(model_name: str, workers: Optional[int] = None):
-    global _model, _model_name, _model_workers
+def get_default_cpu_config(cpu_count: int, worker_limit: int) -> CpuConfig:
+    """Use the whole CPU budget unless the thread count is set explicitly."""
+    worker_limit = max(1, min(cpu_count, worker_limit))
+    configured = os.getenv("WHISPER_CPU_THREADS", "auto").strip().lower()
+    if configured in {"", "auto"}:
+        return balanced_cpu_config(cpu_count, worker_limit)
+    try:
+        threads = min(max(1, cpu_count // worker_limit), max(1, int(configured)))
+        return CpuConfig(worker_limit, threads)
+    except ValueError:
+        log.warning("Некорректное WHISPER_CPU_THREADS=%r; использую авторасчёт", configured)
+        return balanced_cpu_config(cpu_count, worker_limit)
+
+
+def get_model(model_name: str, workers: Optional[int] = None,
+              cpu_threads: Optional[int] = None):
+    global _model, _model_name, _model_workers, _model_cpu_threads
     effective_model = get_effective_model_name(model_name)
-    workers = get_worker_count(effective_model) if workers is None else max(1, workers)
     cpu_count = _get_cpu_count()
-    cpu_threads = max(1, (cpu_count + workers - 1) // workers)
-    if _model is None or _model_name != effective_model or _model_workers != workers:
+    workers = min(cpu_count, get_worker_count(effective_model) if workers is None else max(1, workers))
+    if cpu_threads is None:
+        config = get_default_cpu_config(cpu_count, workers)
+        workers, cpu_threads = config.workers, config.threads
+    else:
+        cpu_threads = min(max(1, cpu_threads), max(1, cpu_count // workers))
+    if (_model is None or _model_name != effective_model or _model_workers != workers
+            or _model_cpu_threads != cpu_threads):
+        clear_model()
         from faster_whisper import WhisperModel
         log.info(
             "Загрузка модели %s (параллельных вызовов: %s, CPU-потоков на вызов: %s)...",
@@ -199,6 +226,7 @@ def get_model(model_name: str, workers: Optional[int] = None):
         )
         _model_name = effective_model
         _model_workers = workers
+        _model_cpu_threads = cpu_threads
         log.info(
             "Для модели %s выбрано %s ворк. (CPU: %s, доступно RAM: %.1f ГБ)",
             effective_model,
@@ -298,17 +326,15 @@ def _transcribe_one_file(
     output_path: str,
     chunk_number: int = 0,
     model_workers: Optional[int] = None,
+    model_cpu_threads: Optional[int] = None,
 ) -> None:
     """Транскрибирует один файл и дописывает результат в output_path."""
-    model = get_model(model_name, workers=model_workers)
+    model = get_model(model_name, workers=model_workers, cpu_threads=model_cpu_threads)
     log.info(f"Начинаю транскрибацию: {input_path}")
 
     segments, info = model.transcribe(
         input_path,
-        language="ru",
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
+        **TRANSCRIBE_OPTIONS,
     )
 
     duration = info.duration
@@ -375,11 +401,19 @@ def transcribe_file(
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write("")
 
+            workers = min(get_worker_count(model_name), len(ranges))
+            cpu_count = _get_cpu_count()
+            clear_model()
+            config = select_cpu_config(
+                get_effective_model_name(model_name), chunk_files, cpu_count,
+                _get_available_memory_bytes(),
+                get_default_cpu_config(cpu_count, workers),
+                cache_dir=BASE_DIR / "cpu_tuning", update_status=update_status,
+            )
+            workers = config.workers
+            get_model(model_name, workers=workers, cpu_threads=config.threads)
             if update_status:
                 update_status(f"🎙 Готово частей: 0/{len(ranges)} · 0,0/{total_minutes} мин")
-
-            workers = min(get_worker_count(model_name), len(ranges))
-            get_model(model_name, workers=workers)
             completed_parts = 0
             completed_seconds = 0.0
             if workers == 1:
@@ -390,8 +424,8 @@ def transcribe_file(
                         output_path=output_path,
                         chunk_number=i,
                         model_workers=workers,
+                        model_cpu_threads=config.threads,
                     )
-                    clear_model()
                     completed_parts += 1
                     completed_seconds += end - start
                     if update_status:
@@ -410,6 +444,7 @@ def transcribe_file(
                             output_path=part_paths[i - 1],
                             chunk_number=i,
                             model_workers=workers,
+                            model_cpu_threads=config.threads,
                         ): i
                         for i in range(1, len(ranges) + 1)
                     }
@@ -431,11 +466,11 @@ def transcribe_file(
                                 shutil.copyfileobj(part_file, output_file)
                             output_file.flush()
                             os.unlink(part_path)
-                clear_model()
 
             log.info(f"Транскрипт сохранён: {output_path}")
             return output_path
         finally:
+            clear_model()
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     try:
@@ -444,10 +479,7 @@ def transcribe_file(
 
         segments, info = model.transcribe(
             input_path,
-            language="ru",
-            beam_size=5,
-            vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500},
+            **TRANSCRIBE_OPTIONS,
         )
 
         duration = info.duration

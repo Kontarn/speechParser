@@ -17,7 +17,7 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import BotCommand, MenuButtonCommands, Update
 from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -579,6 +579,23 @@ def _send_result_sync(bot, chat_id: int, message_id: int, transcript_path: str, 
     future.result()  # ждём завершения перед выходом из потока
 
 
+BOT_COMMANDS = (
+    ("start", "Начать работу с ботом", cmd_start),
+    ("help", "Справка и поддерживаемые форматы", cmd_help),
+    ("ping", "Проверить доступность обработчика", cmd_ping),
+    ("stop", "Остановить расшифровку и получить готовую часть", cmd_stop),
+)
+
+
+async def configure_commands(application: Application) -> None:
+    """Publish command suggestions and enable Telegram's command menu."""
+    await application.bot.set_my_commands([
+        BotCommand(command, description) for command, description, _ in BOT_COMMANDS
+    ])
+    await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    log.info("Меню и подсказки команд Telegram зарегистрированы")
+
+
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан в .env")
@@ -587,12 +604,10 @@ def main() -> None:
     if not PROCESSOR_URL or not PROCESSOR_API_KEY:
         raise RuntimeError("PROCESSOR_URL и PROCESSOR_API_KEY должны быть заданы в .env")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(configure_commands).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("stop", cmd_stop))
+    for command, _, callback in BOT_COMMANDS:
+        app.add_handler(CommandHandler(command, callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(
         filters.AUDIO | filters.VOICE | filters.VIDEO | filters.VIDEO_NOTE | filters.Document.ALL,
