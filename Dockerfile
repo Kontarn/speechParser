@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY requirements.txt requirements-client.txt ./
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
 COPY common.py media.py transcript_parts.py process_control.py mts_fallback.py audio_downloader.py cpu_tuning.py pipeline.py worker_server.py ./

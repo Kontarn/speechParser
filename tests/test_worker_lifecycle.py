@@ -1,3 +1,4 @@
+import os
 import socket
 import subprocess
 import sys
@@ -5,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from decimal import Decimal
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +16,25 @@ import httpx
 import worker_server
 from process_control import start_job_session
 from transcript_parts import commit_part
+
+
+class UploadLimitTests(unittest.TestCase):
+    def limit(self, environment):
+        with patch.dict(os.environ, environment, clear=True):
+            return worker_server._upload_limit_gb()
+
+    def test_decimal_gigabytes_preserve_exact_value(self):
+        for value in ("0.25", "1", "1.5", "0.000000033", "0.000000001"):
+            with self.subTest(value=value):
+                self.assertEqual(self.limit({"MAX_UPLOAD_GB": value}), Decimal(value))
+
+    def test_default_is_ten_decimal_gigabytes(self):
+        self.assertEqual(self.limit({}), Decimal("10"))
+
+    def test_invalid_limits_fail_with_setting_name(self):
+        for value in ("", "0", "-1", "NaN", "sNaN", "Infinity", "oops", "0.0000000001"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "MAX_UPLOAD_GB"):
+                self.limit({"MAX_UPLOAD_GB": value})
 
 
 def cancellable_pipeline(kind, args, output_path, status_queue, result_queue):
@@ -70,6 +91,25 @@ class WorkerApiTests(unittest.TestCase):
             while chunk := client.recv(4096):
                 data.extend(chunk)
         self.assertIn(b"400 Bad Request", data)
+        self.assertEqual(worker_server.JOBS, {})
+        self.assertFalse(list(self.root.iterdir()))
+
+    def test_quarter_gigabyte_limit_rejects_250_mb_plus_one_byte(self):
+        with patch.dict(os.environ, {"MAX_UPLOAD_GB": "0.25"}):
+            maximum = worker_server._upload_limit_gb()
+        with patch.object(worker_server, "MAX_UPLOAD_GB", maximum):
+            response = self.client.get("/limits")
+            self.assertEqual(response.json(), {"max_upload_gb": "0.25"})
+            # Only headers are needed: oversized files must be rejected before
+            # any body is transferred or a job directory is created.
+            with socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3) as client:
+                client.sendall(b"POST /jobs/file?filename=clip.mp4 HTTP/1.1\r\nHost: localhost\r\n"
+                               b"Authorization: Bearer test-key\r\nContent-Length: 250000001\r\n\r\n")
+                data = bytearray()
+                while chunk := client.recv(4096):
+                    data.extend(chunk)
+        self.assertIn(b"413", data)
+        self.assertIn("0.25 ГБ (250 МБ)", data.decode("utf-8"))
         self.assertEqual(worker_server.JOBS, {})
         self.assertFalse(list(self.root.iterdir()))
 

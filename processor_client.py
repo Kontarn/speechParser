@@ -1,7 +1,9 @@
 """HTTP worker protocol, independent of Telegram and transcription libraries."""
 
 import logging
+import os
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import httpx
@@ -54,7 +56,8 @@ class ProcessorClient:
             temporary.unlink(missing_ok=True)
 
     def run(self, kind: str, args: tuple, output_path: Path, update_status,
-            cancelled=lambda: False, on_submitted=lambda job_id: None) -> str:
+            cancelled=lambda: False, on_submitted=lambda job_id: None,
+            on_upload_progress=lambda sent, total: None) -> str:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         # An old transcript must never become the partial result of a new job.
         output_path.unlink(missing_ok=True)
@@ -74,21 +77,39 @@ class ProcessorClient:
                                        timeout=timeout())
             elif kind == "file":
                 path, model = args
+                with open(path, "rb") as source:
+                    size = os.fstat(source.fileno()).st_size
+                    # Older workers have no limits endpoint; their POST still
+                    # enforces its size limit. Never retry the upload itself.
+                    limits = client.get(f"{self.url}/limits", timeout=timeout())
+                    if limits.status_code != 404:
+                        limits.raise_for_status()
+                        maximum_gb = Decimal(str(limits.json()["max_upload_gb"]))
+                        if size > maximum_gb * 1_000_000_000:
+                            raise ValueError(
+                                f"Файл: {size / 1_000_000:g} МБ; "
+                                f"лимит воркера: {maximum_gb.normalize():f} ГБ "
+                                f"({(maximum_gb * 1000).normalize():f} МБ). "
+                                "Увеличь MAX_UPLOAD_GB на сервере и перезапусти воркер."
+                            )
 
-                def upload():
-                    with open(path, "rb") as source:
+                    def upload():
+                        sent = 0
+                        on_upload_progress(sent, size)
                         while chunk := source.read(64 * 1024):
                             timeout()
                             if cancelled():
                                 raise TranscriptionCancelled
                             yield chunk
+                            sent += len(chunk)
+                            on_upload_progress(sent, size)
 
-                response = client.post(
-                    f"{self.url}/jobs/file", params={"filename": Path(path).name, "model": model},
-                    content=upload(), headers={"Content-Type": "application/octet-stream",
-                                              "Content-Length": str(Path(path).stat().st_size)},
-                    timeout=timeout(),
-                )
+                    response = client.post(
+                        f"{self.url}/jobs/file", params={"filename": Path(path).name, "model": model},
+                        content=upload(), headers={"Content-Type": "application/octet-stream",
+                                                  "Content-Length": str(size)},
+                        timeout=timeout(),
+                    )
             else:
                 raise ValueError(f"Неизвестный тип задания: {kind}")
             response.raise_for_status()
@@ -100,7 +121,9 @@ class ProcessorClient:
             try:
                 while True:
                     if cancelled() and not cancel_sent:
-                        client.delete(job_url, timeout=timeout()).raise_for_status()
+                        # Cancelling a job that just completed must not delete
+                        # its transcript before the result can be downloaded.
+                        client.delete(job_url, params={"cancel_only": "1"}, timeout=timeout()).raise_for_status()
                         cancel_sent = True
                     response = client.get(job_url, timeout=timeout())
                     response.raise_for_status()
@@ -121,7 +144,7 @@ class ProcessorClient:
             except TimeoutError:
                 # Cancellation must not replace the actual deadline error.
                 try:
-                    client.delete(job_url, timeout=5)
+                    client.delete(job_url, params={"cancel_only": "1"}, timeout=5)
                 except httpx.HTTPError:
                     log.warning("Не удалось отменить просроченное задание %s", remote_id)
                 raise

@@ -12,6 +12,7 @@ import signal
 import threading
 import time
 import uuid
+from decimal import Decimal, InvalidOperation
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,12 +34,29 @@ logging.basicConfig(
 )
 log = logging.getLogger("worker_server")
 
+
+def _upload_limit_gb() -> Decimal:
+    try:
+        amount = Decimal(os.getenv("MAX_UPLOAD_GB", "10"))
+        if not amount.is_finite() or amount <= 0:
+            raise ValueError
+        size = amount * 1_000_000_000
+        if size != size.to_integral_value():
+            raise ValueError
+        return amount
+    except (InvalidOperation, ValueError):
+        raise ValueError(
+            "MAX_UPLOAD_GB должен быть положительным числом гигабайт. "
+            "Например, 0.25 = 250 МБ (1 ГБ = 1000 МБ)."
+        ) from None
+
+
 API_KEY = os.getenv("PROCESSOR_API_KEY", "")
 HOST = os.getenv("PROCESSOR_HOST", "127.0.0.1")
 PORT = int(os.getenv("PROCESSOR_PORT", "8080"))
 MTS_SESSION_ID = os.getenv("MTS_SESSION_ID", "")
 DEFAULT_MODEL = os.getenv("WHISPER_MODEL", "medium")
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(200 * 1024 * 1024)))
+MAX_UPLOAD_GB = _upload_limit_gb()
 MAX_CONCURRENT_JOBS = max(1, int(os.getenv("SERVER_MAX_CONCURRENT_JOBS", "1")))
 JOB_TIMEOUT_SECONDS = max(1, int(os.getenv("TRANSCRIPTION_TIMEOUT_SECONDS", str(3 * 60 * 60))))
 JOB_RETENTION_SECONDS = max(3600, int(os.getenv("JOB_RETENTION_SECONDS", str(24 * 60 * 60))))
@@ -263,6 +281,10 @@ class ProcessorHandler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
 
+        if parsed.path == "/limits":
+            self._send_json(HTTPStatus.OK, {"max_upload_gb": str(MAX_UPLOAD_GB)})
+            return
+
         parts = parsed.path.strip("/").split("/")
         if len(parts) == 2 and parts[0] == "jobs":
             with JOBS_LOCK:
@@ -344,8 +366,12 @@ class ProcessorHandler(BaseHTTPRequestHandler):
             if extension not in SUPPORTED_EXTENSIONS:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Формат файла не поддерживается."})
                 return
-            if length <= 0 or length > MAX_UPLOAD_BYTES:
-                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "Некорректный размер файла."})
+            if length <= 0 or length > MAX_UPLOAD_GB * 1_000_000_000:
+                self._send_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {
+                    "error": f"Файл пуст или превышает лимит {MAX_UPLOAD_GB.normalize():f} ГБ "
+                             f"({(MAX_UPLOAD_GB * 1000).normalize():f} МБ). "
+                             "Лимит задаётся в MAX_UPLOAD_GB на сервере.",
+                })
                 return
 
             job_id = uuid.uuid4().hex
@@ -385,7 +411,9 @@ class ProcessorHandler(BaseHTTPRequestHandler):
     def do_DELETE(self) -> None:
         if not self._require_auth():
             return
-        parts = urlsplit(self.path).path.strip("/").split("/")
+        parsed = urlsplit(self.path)
+        parts = parsed.path.strip("/").split("/")
+        cancel_only = parse_qs(parsed.query).get("cancel_only") == ["1"]
         if len(parts) != 2 or parts[0] != "jobs":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Неизвестный endpoint."})
             return
@@ -396,6 +424,8 @@ class ProcessorHandler(BaseHTTPRequestHandler):
             if job and job["status"] in {"uploading", "queued", "running"}:
                 job["cancel_event"].set()
                 status = "cancellation_requested"
+            elif job and cancel_only:
+                status = job["status"]
             elif job:
                 JOBS.pop(job_id)
                 job_dir = JOBS_DIR / job_id
@@ -406,7 +436,8 @@ class ProcessorHandler(BaseHTTPRequestHandler):
             shutil.rmtree(job_dir, ignore_errors=True)
             self._send_json(HTTPStatus.OK, {"status": status})
         else:
-            self._send_json(HTTPStatus.ACCEPTED, {"status": status})
+            self._send_json(HTTPStatus.ACCEPTED if status == "cancellation_requested" else HTTPStatus.OK,
+                            {"status": status})
 
 
 def main() -> None:
