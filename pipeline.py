@@ -313,16 +313,10 @@ def _format_minutes(seconds: float) -> str:
 
 def _transcribe_one_file(
     input_path: str,
-    model_name: str,
     output_path: str,
-    chunk_number: int = 0,
-    model_workers: int | None = None,
-    model_cpu_threads: int | None = None,
-    model=None,
+    model,
 ) -> None:
-    """Транскрибирует один файл и дописывает результат в output_path."""
-    if model is None:
-        model = get_model(model_name, workers=model_workers, cpu_threads=model_cpu_threads)
+    """Транскрибирует одну часть общей моделью и записывает её текст."""
     log.info(f"Начинаю транскрибацию: {input_path}")
 
     segments, info = model.transcribe(
@@ -395,9 +389,7 @@ def transcribe_file(
 
             def transcribe_part(number):
                 return commit_part(output_path, number, lambda path: _transcribe_one_file(
-                    input_path=chunk_files[number - 1], model_name=model_name,
-                    output_path=path, chunk_number=number, model_workers=workers,
-                    model_cpu_threads=config.threads, model=model,
+                    input_path=chunk_files[number - 1], output_path=path, model=model,
                 ))
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -475,17 +467,11 @@ def run_pipeline_file(
     input_path: str,
     model_name: str,
     update_status: Callable[[str], None],
-    output_path: str | None = None,
+    output_path: str,
 ) -> str:
     """
     Пайплайн для уже скачанного файла: транскрибировать → вернуть путь к .txt.
     """
-    if output_path is None:
-        output_dir = BASE_DIR / "results"
-        output_dir.mkdir(exist_ok=True)
-        stem = Path(input_path).stem
-        output_path = str(output_dir / f"transcript_{stem}.txt")
-
     update_status("🎙 Транскрибирую...")
     transcribe_file(input_path, model_name, output_path, update_status)
 
@@ -497,7 +483,7 @@ def run_pipeline(
     model_name: str,
     session_id: str | None,
     update_status: Callable[[str], None],
-    output_path: str | None = None,
+    output_path: str,
 ) -> str:
     """
     Полный пайплайн: скачать → транскрибировать → вернуть путь к .txt.
@@ -510,12 +496,9 @@ def run_pipeline(
     event_session_id, record_id = parse_mts_url(url)
     log.info(f"event_session={event_session_id}, record_id={record_id}")
 
-    output_dir = BASE_DIR / "results"
-    output_dir.mkdir(exist_ok=True)
-    final_path = output_path or str(output_dir / f"transcript_{event_session_id}.txt")
-    Path(final_path).write_text("", encoding="utf-8")
+    Path(output_path).write_text("", encoding="utf-8")
 
-    work_dir = tempfile.mkdtemp(prefix="job_", dir=Path(final_path).parent)
+    work_dir = tempfile.mkdtemp(prefix="job_", dir=Path(output_path).parent)
     try:
         # Шаг 1 — скачать
         update_status("⬇️ Скачиваю аудио дорожку...")
@@ -536,11 +519,10 @@ def run_pipeline(
 
         # Шаг 2 — транскрибировать
         update_status(f"🎙 Транскрибирую... (модель {model_name}, это займёт время)")
-        transcript_path = final_path
-        transcribe_file(media_path, model_name, transcript_path, update_status)
+        transcribe_file(media_path, model_name, output_path, update_status)
     finally:
         # Удаляем рабочую директорию после завершения
         shutil.rmtree(work_dir, ignore_errors=True)
         log.info(f"Рабочая директория удалена: {work_dir}")
 
-    return final_path
+    return output_path

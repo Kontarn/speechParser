@@ -1,0 +1,2 @@
+-r requirements-client.txt
+python-telegram-bot==22.8

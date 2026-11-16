@@ -26,7 +26,7 @@ class QueueTests(unittest.TestCase):
             self.addCleanup(setting.stop)
 
     def test_fifo_waiters_start_after_a_slot_is_released(self):
-        first, second, third = [bot.register_job("url", 1, 1, i) for i in range(3)]
+        first, second, third = [bot.register_job(1, 1) for _ in range(3)]
         self.assertTrue(bot.acquire_job_slot(first))
         self.assertFalse(bot.acquire_job_slot(second))
         self.assertEqual(bot.JOB_QUEUE, [second, third])
@@ -48,8 +48,8 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(bot.ACTIVE_JOBS, 0)
 
     def test_cancelling_a_queued_job_does_not_release_another_jobs_slot(self):
-        active = bot.register_job("url", 1, 1, 1)
-        queued = bot.register_job("url", 1, 1, 2)
+        active = bot.register_job(1, 1)
+        queued = bot.register_job(1, 1)
         self.assertTrue(bot.acquire_job_slot(active))
         bot.JOB_STATUS[queued]["cancel_requested"] = True
         self.assertFalse(bot.wait_for_job_slot(queued))
@@ -100,8 +100,8 @@ class QueueTests(unittest.TestCase):
         delivery_started = threading.Event()
         allow_delivery = threading.Event()
         next_started = threading.Event()
-        first = bot.register_job("url", 1, 1, 1)
-        second = bot.register_job("url", 1, 1, 2)
+        first = bot.register_job(1, 1)
+        second = bot.register_job(1, 1)
 
         def run(kind, args, update_status, job_id):
             if job_id == second:
@@ -220,7 +220,8 @@ class TranscriptTests(unittest.TestCase):
                 stream.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
                 stream.writeframes(bytes(6 * 16000 * 2))
 
-            def transcribe(input_path, model_name, output_path, chunk_number, **kwargs):
+            def transcribe(input_path, output_path, model):
+                chunk_number = int(Path(input_path).stem.rsplit("_", 1)[1])
                 if chunk_number == 1:
                     self.assertTrue(first_can_finish.wait(3))
                 elif chunk_number == 3:

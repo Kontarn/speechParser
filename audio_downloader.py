@@ -14,7 +14,6 @@ import os
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
 from pathlib import Path
 
 import httpx
@@ -31,7 +30,7 @@ def _make_cookies(session_id: str | None) -> dict:
     return {"access": session_id} if session_id else {}
 
 
-def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: str | None, *, client=None) -> dict:
+def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: str | None, *, client) -> dict:
     """Получает JSON с метаданными записи через API МТС Линк."""
     if record_id:
         url = (
@@ -45,8 +44,7 @@ def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: 
         )
 
     log.info(f"Запрос метаданных: {url}")
-    with nullcontext(client) if client is not None else httpx.Client(timeout=TIMEOUT) as http:
-        response = http.get(url, headers=HEADERS, cookies=_make_cookies(session_id))
+    response = client.get(url, headers=HEADERS, cookies=_make_cookies(session_id))
 
     if response.status_code == 403:
         raise PermissionError("Доступ запрещён (403). Укажи session_id для приватной записи.")
@@ -58,28 +56,26 @@ def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: 
     return payload
 
 
-def _get_content_type(url: str, session_id: str | None, *, client=None) -> str:
+def _get_content_type(url: str, session_id: str | None, *, client) -> str:
     """Use a streamed GET when the media server does not support useful HEADs."""
     try:
-        with nullcontext(client) if client is not None else httpx.Client(timeout=TIMEOUT) as http:
-            response = http.head(url, headers=HEADERS, cookies=_make_cookies(session_id), follow_redirects=True)
-            content_type = response.headers.get("content-type", "").lower()
-            if response.status_code in {405, 501} or not content_type or content_type.startswith("application/octet-stream"):
-                with http.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
-                                 follow_redirects=True) as media:
-                    media.raise_for_status()
-                    return media.headers.get("content-type", "").lower()
-            response.raise_for_status()
-            return content_type
+        response = client.head(url, headers=HEADERS, cookies=_make_cookies(session_id), follow_redirects=True)
+        content_type = response.headers.get("content-type", "").lower()
+        if response.status_code in {405, 501} or not content_type or content_type.startswith("application/octet-stream"):
+            with client.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
+                               follow_redirects=True) as media:
+                media.raise_for_status()
+                return media.headers.get("content-type", "").lower()
+        response.raise_for_status()
+        return content_type
     except httpx.HTTPError as error:
         log.warning("Не удалось определить тип медиафрагмента (%s)", type(error).__name__)
         return ""
 
 
-def _download_chunk(url: str, path: str, session_id: str | None, *, client=None) -> None:
-    context = nullcontext(client) if client is not None else httpx.Client(timeout=TIMEOUT)
-    with context as http, http.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
-                                      follow_redirects=True) as response:
+def _download_chunk(url: str, path: str, session_id: str | None, *, client) -> None:
+    with client.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
+                       follow_redirects=True) as response:
         response.raise_for_status()
         with open(path, "wb") as output:
             output.writelines(response.iter_bytes(chunk_size=65536))

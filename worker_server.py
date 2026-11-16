@@ -145,7 +145,6 @@ def _run_job(job_id: str) -> None:
             args=(job["kind"], job["args"], job["output_path"], status_queue, result_queue),
             daemon=True,
         )
-        _set_job(job_id, process=process)
         process.start()
         deadline = time.monotonic() + JOB_TIMEOUT_SECONDS
 
@@ -248,8 +247,7 @@ class ProcessorHandler(BaseHTTPRequestHandler):
             shutil.rmtree(JOBS_DIR / job_id, ignore_errors=True)
             raise
 
-    def _create_job(self, kind: str, args: tuple, input_path: str | None = None,
-                    *, job_id: str | None = None, start: bool = True) -> str:
+    def _create_job(self, kind: str, args: tuple, *, job_id: str | None = None, start: bool = True) -> str:
         job_id = job_id or uuid.uuid4().hex
         job_dir = JOBS_DIR / job_id
         with JOBS_LOCK:
@@ -261,10 +259,10 @@ class ProcessorHandler(BaseHTTPRequestHandler):
                 output_path = str(job_dir / "transcript.txt")
                 Path(output_path).write_text("", encoding="utf-8")
                 JOBS[job_id] = {
-                    "kind": kind, "args": args, "input_path": input_path,
+                    "kind": kind, "args": args,
                     "output_path": output_path, "status": "queued" if start else "uploading",
                     "message": "Задание в очереди сервера.", "error": None,
-                    "created_at": time.time(), "cancel_event": threading.Event(), "process": None,
+                    "created_at": time.time(), "cancel_event": threading.Event(),
                 }
             except Exception:
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -301,7 +299,6 @@ class ProcessorHandler(BaseHTTPRequestHandler):
                 job = JOBS.get(parts[1])
                 if job is None:
                     result_file = None
-                    ready = False
                 else:
                     ready = job["status"] in {"completed", "cancelled"}
                     try:
@@ -379,7 +376,7 @@ class ProcessorHandler(BaseHTTPRequestHandler):
             input_path = job_dir / f"input{extension}"
             model = query.get("model", [DEFAULT_MODEL])[0]
             try:
-                self._create_job("file", (str(input_path), model), str(input_path), job_id=job_id, start=False)
+                self._create_job("file", (str(input_path), model), job_id=job_id, start=False)
             except OverflowError as error:
                 self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": str(error)})
                 return
@@ -443,7 +440,7 @@ class ProcessorHandler(BaseHTTPRequestHandler):
 def main() -> None:
     if not API_KEY:
         raise RuntimeError("PROCESSOR_API_KEY не задан")
-    def shutdown(signum, frame):
+    def shutdown(_signum, _frame):
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, shutdown)

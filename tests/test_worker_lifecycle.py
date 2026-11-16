@@ -29,7 +29,7 @@ class UploadLimitTests(unittest.TestCase):
                 self.assertEqual(self.limit({"MAX_UPLOAD_GB": value}), Decimal(value))
 
     def test_default_is_ten_decimal_gigabytes(self):
-        self.assertEqual(self.limit({}), Decimal("10"))
+        self.assertEqual(self.limit({}), Decimal(10))
 
     def test_invalid_limits_fail_with_setting_name(self):
         for value in ("", "0", "-1", "NaN", "sNaN", "Infinity", "oops", "0.0000000001"):

@@ -16,3 +16,5 @@ tmp/
 !README.md
 !requirements.txt
 !requirements-client.txt
+!requirements-bot.txt
+!requirements-worker.txt

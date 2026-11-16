@@ -87,7 +87,7 @@ def main(argv=None) -> int:
     remote_id = None
     last_progress = -math.inf
 
-    def interrupt(signum, frame):
+    def interrupt(_signum, _frame):
         nonlocal stop_requested
         if stop_requested:
             raise KeyboardInterrupt

@@ -23,7 +23,7 @@ class CliTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         for name, value in (("JOBS_DIR", self.root / "jobs"), ("JOBS", {}),
-                            ("API_KEY", "test-key"), ("MAX_UPLOAD_GB", Decimal("10"))):
+                            ("API_KEY", "test-key"), ("MAX_UPLOAD_GB", Decimal(10))):
             setting = patch.object(worker_server, name, value)
             setting.start()
             self.addCleanup(setting.stop)
@@ -72,7 +72,7 @@ class CliTests(unittest.TestCase):
 
         def complete(job_id):
             job = worker_server.JOBS[job_id]
-            received.append(Path(job["input_path"]).stat().st_size)
+            received.append(Path(job["args"][0]).stat().st_size)
             self.complete(job_id)
 
         original_handler = signal.getsignal(signal.SIGINT)

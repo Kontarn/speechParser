@@ -33,15 +33,15 @@ class JobLimiterTests(unittest.TestCase):
         self.assertEqual(bot.ACTIVE_JOBS, 1)
 
     def test_registers_job_and_tracks_position(self):
-        job_id = bot.register_job(job_type="test", user_id=1, chat_id=2, message_id=3)
+        job_id = bot.register_job(user_id=1, chat_id=2)
         self.assertIn(job_id, bot.JOB_STATUS)
         self.assertEqual(bot.get_queue_position(job_id), 1)
 
     def test_waits_for_slot_with_notifications(self):
         bot.MAX_CONCURRENT_JOBS = 1
-        first = bot.register_job(job_type="first", user_id=1, chat_id=2, message_id=3)
+        first = bot.register_job(user_id=1, chat_id=2)
         self.assertTrue(bot.acquire_job_slot(first))
-        second = bot.register_job(job_type="second", user_id=1, chat_id=2, message_id=4)
+        second = bot.register_job(user_id=1, chat_id=2)
         self.assertEqual(bot.get_queue_position(second), 1)
         bot.release_job_slot(first)
         self.assertTrue(bot.acquire_job_slot(second))
@@ -215,8 +215,9 @@ class JobLimiterTests(unittest.TestCase):
                 pipeline._model_workers = workers
                 return object()
 
-            def fake_transcribe_one_file(input_path, model_name, output_path, **kwargs):
-                Path(output_path).write_text(f"part{kwargs['chunk_number']}\n", encoding="utf-8")
+            def fake_transcribe_one_file(input_path, output_path, model):
+                number = int(Path(input_path).stem.rsplit("_", 1)[1])
+                Path(output_path).write_text(f"part{number}\n", encoding="utf-8")
 
             with (
                 patch.dict("os.environ", {"WHISPER_AUTOTUNE": "0"}),

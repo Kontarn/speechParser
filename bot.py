@@ -100,10 +100,9 @@ def _processor_client() -> ProcessorClient:
                            TRANSCRIPTION_TIMEOUT_SECONDS, REMOTE_POLL_INTERVAL_SECONDS)
 
 
-def _run_pipeline_with_timeout(kind: str, args: tuple, update_status, job_id: str | None = None) -> str:
+def _run_pipeline_with_timeout(kind: str, args: tuple, update_status, job_id: str) -> str:
     with JOB_CONDITION:
-        job = JOB_STATUS.get(job_id, {})
-        output_path = Path(job.get("output_path") or get_transcript_path(kind, args))
+        output_path = Path(JOB_STATUS[job_id]["output_path"])
 
     def cancelled():
         with JOB_CONDITION:
@@ -141,7 +140,7 @@ def _refresh_queue_positions() -> None:
         JOB_STATUS[job_id]["position"] = position
 
 
-def register_job(job_type: str, user_id: int, chat_id: int, message_id: int) -> str:
+def register_job(user_id: int, chat_id: int) -> str:
     with JOB_CONDITION:
         now = time.time()
         for old_id, job in list(JOB_STATUS.items()):
@@ -156,8 +155,7 @@ def register_job(job_type: str, user_id: int, chat_id: int, message_id: int) -> 
             raise OverflowError("Очередь заполнена. Повтори запрос позже.")
         job_id = uuid.uuid4().hex
         JOB_STATUS[job_id] = {
-            "job_type": job_type, "user_id": user_id, "chat_id": chat_id,
-            "message_id": message_id, "status": "queued", "position": 0,
+            "user_id": user_id, "chat_id": chat_id, "status": "queued", "position": 0,
             "created_at": now, "cancel_requested": False, "slot_acquired": False,
         }
         JOB_QUEUE.append(job_id)
@@ -218,14 +216,13 @@ def is_mts_link(text: str) -> bool:
     return text.strip().startswith(MTS_LINK_PREFIX)
 
 
-def get_transcript_path(kind: str, args: tuple, job_id: str | None = None) -> Path:
+def get_transcript_path(kind: str, args: tuple, job_id: str) -> Path:
     if kind == "file":
         stem = Path(args[0]).stem
     else:
         event_session_id, _ = parse_mts_url(args[0])
         stem = event_session_id
-    suffix = f"_{job_id}" if job_id else ""
-    return BASE_DIR / "results" / f"transcript_{stem}{suffix}.txt"
+    return BASE_DIR / "results" / f"transcript_{stem}_{job_id}.txt"
 
 
 async def _edit_status(telegram_bot, chat_id: int, message_id: int, text: str) -> None:
@@ -484,7 +481,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         parse_mts_url(text)
-        job_id = register_job("mts_link", update.effective_user.id, update.effective_chat.id, update.message.message_id)
+        job_id = register_job(update.effective_user.id, update.effective_chat.id)
     except (ValueError, OverflowError) as error:
         await update.message.reply_text(str(error))
         return
@@ -544,7 +541,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     try:
-        job_id = register_job("file", message.from_user.id, update.effective_chat.id, message.message_id)
+        job_id = register_job(message.from_user.id, update.effective_chat.id)
     except OverflowError as error:
         await message.reply_text(str(error))
         return
@@ -659,6 +656,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import warnings
-    warnings.filterwarnings("ignore", category=UserWarning, module="multiprocessing")
     main()

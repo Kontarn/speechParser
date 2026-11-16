@@ -142,7 +142,6 @@ class RemoteProcessingTests(unittest.TestCase):
         url = f"https://my.mts-link.ru/1/2/record-new/{uuid.uuid4().int}"
         local_job_id = uuid.uuid4().hex
         output_path = None
-        bot.JOB_STATUS[local_job_id] = {"remote_job_id": None}
 
         try:
             with (
@@ -152,7 +151,8 @@ class RemoteProcessingTests(unittest.TestCase):
                 patch.object(bot, "PROCESSOR_API_KEY", "test-api-key"),
                 patch.object(bot, "REMOTE_POLL_INTERVAL_SECONDS", 0.01),
             ):
-                output_path = bot.get_transcript_path("url", (url, "medium"))
+                output_path = bot.get_transcript_path("url", (url, "medium"), local_job_id)
+                bot.JOB_STATUS[local_job_id] = {"remote_job_id": None, "output_path": str(output_path)}
                 result = bot._run_pipeline_with_timeout(
                     "url", (url, "medium"), lambda _: None, local_job_id
                 )
@@ -176,6 +176,7 @@ class RemoteProcessingTests(unittest.TestCase):
     def test_bot_uploads_file_and_downloads_result(self):
         server, server_thread = self._start_server()
         output_path = None
+        local_job_id = uuid.uuid4().hex
 
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3") as input_file:
@@ -188,17 +189,21 @@ class RemoteProcessingTests(unittest.TestCase):
                     patch.object(bot, "PROCESSOR_API_KEY", "test-api-key"),
                     patch.object(bot, "REMOTE_POLL_INTERVAL_SECONDS", 0.01),
                 ):
-                    output_path = bot.get_transcript_path("file", (input_file.name, "medium"))
+                    output_path = bot.get_transcript_path("file", (input_file.name, "medium"), local_job_id)
+                    bot.JOB_STATUS[local_job_id] = {"remote_job_id": None, "output_path": str(output_path)}
                     result = bot._run_pipeline_with_timeout(
                         "file",
                         (input_file.name, "medium"),
                         lambda _: None,
+                        local_job_id,
                     )
                     self.assertEqual(Path(result).read_text(encoding="utf-8"), "Удалённая расшифровка\n")
+                    bot._cleanup_remote_job(local_job_id)
         finally:
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=2)
+            bot.JOB_STATUS.pop(local_job_id, None)
             if output_path and output_path.exists():
                 output_path.unlink()
 
