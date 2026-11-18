@@ -2,6 +2,14 @@
 
 import os
 import signal
+import threading
+
+
+def configure_progress_lock() -> None:
+    """Progress bars in a job share threads only. SIGTERM can strand an mp.RLock."""
+    from tqdm import tqdm
+
+    tqdm.set_lock(threading.RLock())
 
 
 def start_job_session() -> None:

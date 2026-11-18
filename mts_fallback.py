@@ -4,8 +4,11 @@ import json
 import sys
 from pathlib import Path
 
+from process_control import configure_progress_lock
+
 
 def main():
+    configure_progress_lock()
     from mtslinker.webinar import fetch_webinar_data
 
     request = json.load(sys.stdin)

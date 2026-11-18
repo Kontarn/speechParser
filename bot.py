@@ -239,6 +239,11 @@ def _deliver_transcript(telegram_bot, chat_id, message_id, transcript_path, main
         raise RuntimeError("Файл расшифровки не найден")
 
     async def send():
+        if partial and not content:
+            text = "⏹ Расшифровка остановлена, готового текста пока нет."
+            await telegram_bot.send_message(chat_id=chat_id, text=text)
+            await _edit_status(telegram_bot, chat_id, message_id, text)
+            return
         if not partial and not content:
             await _edit_status(telegram_bot, chat_id, message_id, "В записи не обнаружено речи.")
             return
@@ -249,8 +254,7 @@ def _deliver_transcript(telegram_bot, chat_id, message_id, transcript_path, main
                 chat_id=chat_id, document=content, filename=path.name,
                 caption="⏹ Расшифровка остановлена. Файл содержит уже готовую часть." if partial else "✅ Готово!",
             )
-        text = ("⏹ Остановлено. Частичная расшифровка отправлена выше." if content
-                else "⏹ Расшифровка остановлена, готового текста пока нет.") if partial else "✅ Готово! Файл отправлен выше."
+        text = "⏹ Остановлено. Частичная расшифровка отправлена выше." if partial else "✅ Готово! Файл отправлен выше."
         await _edit_status(telegram_bot, chat_id, message_id, text)
 
     asyncio.run_coroutine_threadsafe(send(), main_loop).result(timeout=60)

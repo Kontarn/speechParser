@@ -16,6 +16,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from common import TRANSCRIBE_OPTIONS
+from process_control import configure_progress_lock
 
 log = logging.getLogger(__name__)
 GIB = 1024 ** 3
@@ -250,6 +251,7 @@ def _probe(request: dict) -> dict:
     limit = int(request["memory_limit"])
     resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
 
+    configure_progress_lock()
     from faster_whisper import WhisperModel
 
     config = CpuConfig(**request["config"])

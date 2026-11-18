@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 
 from common import BASE_DIR, SUPPORTED_EXTENSIONS, parse_mts_url
 from pipeline import run_pipeline, run_pipeline_file
-from process_control import start_job_session, stop_process
+from process_control import configure_progress_lock, start_job_session, stop_process
 from transcript_parts import assemble_partial
 
 load_dotenv(Path(__file__).resolve().with_name(".env.server"))
@@ -92,6 +92,7 @@ def _cleanup_expired_jobs() -> None:
 
 def _pipeline_process_target(kind, args, output_path, status_queue, result_queue) -> None:
     start_job_session()
+    configure_progress_lock()
     logging.getLogger("httpx").setLevel(logging.WARNING)
     def process_status(message: str) -> None:
         status_queue.put(message)

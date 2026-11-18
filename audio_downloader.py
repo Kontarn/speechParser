@@ -13,14 +13,19 @@ import math
 import os
 import subprocess
 import tempfile
+import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import TypeVar
 
 import httpx
 
 log = logging.getLogger(__name__)
 
 TIMEOUT = httpx.Timeout(60, connect=15)
+REQUEST_ATTEMPTS = 3
+_T = TypeVar("_T")
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
 }
@@ -28,6 +33,19 @@ HEADERS = {
 
 def _make_cookies(session_id: str | None) -> dict:
     return {"access": session_id} if session_id else {}
+
+
+def _retry_request(operation: Callable[[], _T], description: str) -> _T:
+    for attempt in range(1, REQUEST_ATTEMPTS + 1):
+        try:
+            return operation()
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as error:
+            if attempt == REQUEST_ATTEMPTS:
+                raise
+            log.warning("%s: %s; повтор %s/%s", description, type(error).__name__,
+                        attempt + 1, REQUEST_ATTEMPTS)
+            time.sleep(0.5 * attempt)
+    raise AssertionError("REQUEST_ATTEMPTS must be positive")
 
 
 def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: str | None, *, client) -> dict:
@@ -44,7 +62,10 @@ def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: 
         )
 
     log.info(f"Запрос метаданных: {url}")
-    response = client.get(url, headers=HEADERS, cookies=_make_cookies(session_id))
+    response = _retry_request(
+        lambda: client.get(url, headers=HEADERS, cookies=_make_cookies(session_id)),
+        "Запрос метаданных МТС Линк",
+    )
 
     if response.status_code == 403:
         raise PermissionError("Доступ запрещён (403). Укажи session_id для приватной записи.")
@@ -58,27 +79,37 @@ def _fetch_event_json(event_session_id: str, record_id: str | None, session_id: 
 
 def _get_content_type(url: str, session_id: str | None, *, client) -> str:
     """Use a streamed GET when the media server does not support useful HEADs."""
+    host = httpx.URL(url).host
     try:
         response = client.head(url, headers=HEADERS, cookies=_make_cookies(session_id), follow_redirects=True)
         content_type = response.headers.get("content-type", "").lower()
-        if response.status_code in {405, 501} or not content_type or content_type.startswith("application/octet-stream"):
-            with client.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
-                               follow_redirects=True) as media:
-                media.raise_for_status()
-                return media.headers.get("content-type", "").lower()
-        response.raise_for_status()
-        return content_type
+        if response.status_code not in {405, 501}:
+            response.raise_for_status()
+            if content_type and not content_type.startswith("application/octet-stream"):
+                return content_type
     except httpx.HTTPError as error:
-        log.warning("Не удалось определить тип медиафрагмента (%s)", type(error).__name__)
-        return ""
+        log.warning("HEAD к %s не сработал (%s); проверяю через GET", host, type(error).__name__)
+
+    def probe() -> str:
+        with client.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
+                           follow_redirects=True) as media:
+            media.raise_for_status()
+            return media.headers.get("content-type", "").lower()
+
+    # A failed probe must abort selection: otherwise inaccessible audio tracks
+    # disappear silently, possibly leaving a seemingly valid partial recording.
+    return _retry_request(probe, f"Проверка медиафрагмента на {host}")
 
 
 def _download_chunk(url: str, path: str, session_id: str | None, *, client) -> None:
-    with client.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
-                       follow_redirects=True) as response:
-        response.raise_for_status()
-        with open(path, "wb") as output:
-            output.writelines(response.iter_bytes(chunk_size=65536))
+    def download() -> None:
+        with client.stream("GET", url, headers=HEADERS, cookies=_make_cookies(session_id),
+                           follow_redirects=True) as response:
+            response.raise_for_status()
+            with open(path, "wb") as output:
+                output.writelines(response.iter_bytes(chunk_size=65536))
+
+    _retry_request(download, f"Скачивание медиафрагмента с {httpx.URL(url).host}")
 
 
 def _ffmpeg_mix_timeline(
@@ -226,7 +257,14 @@ def _download_audio_only(
         }
         for future in as_completed(future_to_url):
             url = future_to_url[future]
-            content_types[url] = future.result()
+            try:
+                content_types[url] = future.result()
+            except httpx.HTTPError as error:
+                raise RuntimeError(
+                    f"Не удалось определить тип медиафрагмента на {httpx.URL(url).host} "
+                    f"({type(error).__name__}). Проверьте доступ воркера к серверу "
+                    "медиафрагментов МТС Линк и настройки сети/VPN/прокси."
+                ) from error
 
     for c in chunks:
         log.debug("Медиафрагмент: %s, начало %.3f с", content_types[c["url"]], c["start"])

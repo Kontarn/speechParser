@@ -514,7 +514,8 @@ def run_pipeline(
             except Exception as fallback_error:
                 log.exception("Резервное скачивание тоже не сработало")
                 raise RuntimeError(
-                    f"Не удалось скачать аудио через быстрый и резервный путь: {fallback_error}"
+                    f"Не удалось скачать аудио. Быстрый способ: {fast_error}. "
+                    f"Резервный способ: {fallback_error}"
                 ) from fallback_error
 
         # Шаг 2 — транскрибировать
